@@ -23,11 +23,9 @@ internal sealed class IndexFile
 
 internal static class Index
 {
-    private static readonly JsonSerializerOptions Json = new() { WriteIndented = false };
-
     public static string PathFor(string root) => System.IO.Path.Combine(root, ".memfind", "index.json");
 
-    public static int Build(string root)
+    public static int Build(string root, bool int8)
     {
         if (!Directory.Exists(root))
         {
@@ -38,9 +36,9 @@ internal static class Index
         var sw = Stopwatch.StartNew();
         var docs = Store.Parse(root);
 
-        using var embedder = Embedder.Load();
+        using var embedder = Embedder.Load(int8);
 
-        var index = new IndexFile { BuiltAt = DateTime.UtcNow.ToString("o") };
+        var index = new IndexFile { Model = embedder.Model, BuiltAt = DateTime.UtcNow.ToString("o") };
         foreach (var doc in docs)
         {
             index.Items.Add(new IndexItem
@@ -56,7 +54,7 @@ internal static class Index
         var dir = System.IO.Path.Combine(root, ".memfind");
         Directory.CreateDirectory(dir);
         File.WriteAllText(System.IO.Path.Combine(dir, ".gitignore"), "*\n");
-        File.WriteAllText(PathFor(root), JsonSerializer.Serialize(index, Json));
+        File.WriteAllText(PathFor(root), JsonSerializer.Serialize(index, Ctx.Default.IndexFile));
 
         sw.Stop();
         Console.Error.WriteLine($"indexed {index.Items.Count} memories in {sw.Elapsed.TotalSeconds:F1} s -> {PathFor(root)}");
@@ -72,14 +70,14 @@ internal static class Index
             return 1;
         }
 
-        var index = JsonSerializer.Deserialize<IndexFile>(File.ReadAllText(path), Json);
+        var index = JsonSerializer.Deserialize(File.ReadAllText(path), Ctx.Default.IndexFile);
         if (index is null || index.Items.Count == 0)
         {
             Console.Error.WriteLine("no index — run: memfind index");
             return 1;
         }
 
-        using var embedder = Embedder.Load();
+        using var embedder = Embedder.Load(index.Model != Embedder.Fp32ModelName);
         var q = embedder.EmbedQuery(query);
 
         var hits = index.Items

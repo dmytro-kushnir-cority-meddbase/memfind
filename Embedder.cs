@@ -6,24 +6,46 @@ namespace MemFind;
 
 internal sealed class Embedder : IDisposable
 {
-    public const string ModelName = "bge-small-en-v1.5";
+    public const string Fp32ModelName = "bge-small-en-v1.5";
+    public const string Int8ModelName = "bge-small-en-v1.5-int8";
+    public const string ModelName = Fp32ModelName;
     public const int Dim = 384;
     public const string QueryPrefix = "Represent this sentence for searching relevant passages: ";
 
-    private const int MaxTokens = 512;
-    private const string ModelUrl = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx";
-    private const string VocabUrl = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt";
+    public const int MaxTokens = 512;
+    public const int ChatMaxTokens = 256;
+    public const int BatchSize = 64;
+
+    private const string Fp32ModelUrl = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx";
+    private const string Fp32VocabUrl = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt";
+    private const string Int8ModelUrl = "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/onnx/model_quantized.onnx";
+    private const string Int8VocabUrl = "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/vocab.txt";
+
+    private static int _threads = Math.Max(1, Environment.ProcessorCount / 2);
+
+    /// <summary>Intra-op threads per session and the degree of parallelism used while parsing.</summary>
+    public static int Threads
+    {
+        get => _threads;
+        set => _threads = Math.Max(1, value);
+    }
 
     private readonly InferenceSession _session;
-    private readonly BertTokenizer _tokenizer;
+    private readonly ThreadLocal<BertTokenizer> _tokenizers;
     private readonly string[] _inputNames;
     private readonly string _outputName;
     private readonly int _sepId;
+    private readonly int _padId;
 
-    private Embedder(InferenceSession session, BertTokenizer tokenizer)
+    public string Model { get; }
+    public int IntraOpThreads { get; }
+
+    private Embedder(string model, InferenceSession session, int threads, string vocabPath)
     {
+        Model = model;
         _session = session;
-        _tokenizer = tokenizer;
+        IntraOpThreads = threads;
+        _tokenizers = new ThreadLocal<BertTokenizer>(() => BertTokenizer.Create(vocabPath), trackAllValues: false);
 
         var wanted = new[] { "input_ids", "attention_mask", "token_type_ids" };
         _inputNames = wanted.Where(n => session.InputMetadata.ContainsKey(n)).ToArray();
@@ -34,30 +56,48 @@ internal sealed class Embedder : IDisposable
             ? "last_hidden_state"
             : session.OutputMetadata.Keys.First();
 
-        var sep = tokenizer.EncodeToIds("", addSpecialTokens: true);
-        _sepId = sep.Count > 0 ? sep[^1] : 102;
+        var tokenizer = _tokenizers.Value!;
+        _sepId = tokenizer.SeparatorTokenId;
+        _padId = tokenizer.PaddingTokenId;
     }
 
-    public static Embedder Load()
+    public static Embedder Load(bool int8 = true)
     {
-        var dir = Path.Combine(
+        var model = int8 ? Int8ModelName : Fp32ModelName;
+        var root = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "memfind",
-            ModelName);
+            "memfind");
+
+        var dir = Path.Combine(root, model);
         Directory.CreateDirectory(dir);
 
         var modelPath = Path.Combine(dir, "model.onnx");
         var vocabPath = Path.Combine(dir, "vocab.txt");
 
-        EnsureFile(modelPath, ModelUrl);
-        EnsureFile(vocabPath, VocabUrl);
+        EnsureFile(modelPath, int8 ? Int8ModelUrl : Fp32ModelUrl);
+        EnsureVocab(vocabPath, Path.Combine(root, int8 ? Fp32ModelName : Int8ModelName, "vocab.txt"), int8 ? Int8VocabUrl : Fp32VocabUrl);
+
+        var threads = Threads;
 
         var options = new SessionOptions();
         options.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
+        options.IntraOpNumThreads = threads;
+        options.InterOpNumThreads = 1;
 
-        var session = new InferenceSession(modelPath, options);
-        var tokenizer = BertTokenizer.Create(vocabPath);
-        return new Embedder(session, tokenizer);
+        return new Embedder(model, new InferenceSession(modelPath, options), threads, vocabPath);
+    }
+
+    private static void EnsureVocab(string path, string sibling, string url)
+    {
+        if (File.Exists(path) && new FileInfo(path).Length > 0) return;
+
+        if (File.Exists(sibling) && new FileInfo(sibling).Length > 0)
+        {
+            File.Copy(sibling, path);
+            return;
+        }
+
+        EnsureFile(path, url);
     }
 
     private static void EnsureFile(string path, string url)
@@ -105,32 +145,81 @@ internal sealed class Embedder : IDisposable
         Console.Error.WriteLine($"  saved {path}");
     }
 
-    public float[] EmbedQuery(string query) => Embed(QueryPrefix + query);
-
-    public float[] EmbedDocument(string text) => Embed(text);
-
-    private float[] Embed(string text)
+    public int[] Encode(string text, int maxTokens)
     {
-        var ids = _tokenizer.EncodeToIds(text, addSpecialTokens: true);
-        var n = Math.Min(ids.Count, MaxTokens);
+        var tokenizer = _tokenizers.Value!;
+        var ids = tokenizer.EncodeToIds(text, maxTokens, out _, out var charsConsumed);
 
-        var inputIds = new long[n];
-        for (var i = 0; i < n; i++) inputIds[i] = ids[i];
-        if (ids.Count > MaxTokens) inputIds[n - 1] = _sepId;
+        var result = new int[ids.Count];
+        for (var i = 0; i < result.Length; i++) result[i] = ids[i];
+        if (result.Length == maxTokens && charsConsumed < text.Length) result[^1] = _sepId;
+        return result;
+    }
 
-        var dims = new[] { 1, n };
+    public float[] EmbedQuery(string query) => EmbedDocument(QueryPrefix + query);
+
+    public float[] EmbedDocument(string text)
+    {
+        var tokens = new[] { Encode(text, MaxTokens) };
+        var vectors = new float[Dim];
+        RunBatch(_session, tokens, 0, 1, vectors, 0);
+        return vectors;
+    }
+
+    /// <summary>Embeds every token sequence into <paramref name="destination"/> at index * Dim.</summary>
+    public void EmbedMany(IReadOnlyList<int[]> tokens, float[] destination, Action<int>? progress = null)
+    {
+        var order = new int[tokens.Count];
+        for (var i = 0; i < order.Length; i++) order[i] = i;
+        Array.Sort(order, (a, b) => tokens[a].Length.CompareTo(tokens[b].Length));
+
+        var batch = new int[BatchSize][];
+        var pooled = new float[BatchSize * Dim];
+        var done = 0;
+
+        for (var from = 0; from < order.Length; from += BatchSize)
+        {
+            var count = Math.Min(BatchSize, order.Length - from);
+            for (var i = 0; i < count; i++) batch[i] = tokens[order[from + i]];
+
+            RunBatch(_session, batch, 0, count, pooled, 0);
+
+            for (var i = 0; i < count; i++)
+                Array.Copy(pooled, (long)i * Dim, destination, (long)order[from + i] * Dim, Dim);
+
+            done += count;
+            progress?.Invoke(done);
+        }
+    }
+
+    private void RunBatch(InferenceSession session, IReadOnlyList<int[]> batch, int offset, int count, float[] destination, int destinationIndex)
+    {
+        var maxLen = 1;
+        for (var i = 0; i < count; i++) maxLen = Math.Max(maxLen, batch[offset + i].Length);
+
+        var dims = new[] { count, maxLen };
         var inputs = new List<NamedOnnxValue>(_inputNames.Length);
 
         foreach (var name in _inputNames)
         {
-            var data = new long[n];
+            var data = new long[count * maxLen];
             switch (name)
             {
                 case "input_ids":
-                    Array.Copy(inputIds, data, n);
+                    for (var i = 0; i < count; i++)
+                    {
+                        var ids = batch[offset + i];
+                        var row = i * maxLen;
+                        for (var j = 0; j < maxLen; j++) data[row + j] = j < ids.Length ? ids[j] : _padId;
+                    }
                     break;
                 case "attention_mask":
-                    Array.Fill(data, 1L);
+                    for (var i = 0; i < count; i++)
+                    {
+                        var len = batch[offset + i].Length;
+                        var row = i * maxLen;
+                        for (var j = 0; j < len; j++) data[row + j] = 1L;
+                    }
                     break;
                 default:
                     break;
@@ -138,17 +227,30 @@ internal sealed class Embedder : IDisposable
             inputs.Add(NamedOnnxValue.CreateFromTensor(name, new DenseTensor<long>(data, dims)));
         }
 
-        using var results = _session.Run(inputs, new[] { _outputName });
+        using var results = session.Run(inputs, new[] { _outputName });
         var tensor = results.First().AsTensor<float>();
 
-        var vec = new float[Dim];
-        for (var i = 0; i < Dim; i++) vec[i] = tensor[0, 0, i];
+        if (tensor is DenseTensor<float> dense)
+        {
+            var span = dense.Buffer.Span;
+            for (var i = 0; i < count; i++)
+            {
+                var cls = span.Slice(i * maxLen * Dim, Dim);
+                cls.CopyTo(destination.AsSpan((destinationIndex + i) * Dim, Dim));
+            }
+        }
+        else
+        {
+            for (var i = 0; i < count; i++)
+                for (var j = 0; j < Dim; j++)
+                    destination[(destinationIndex + i) * Dim + j] = tensor[i, 0, j];
+        }
 
-        Normalize(vec);
-        return vec;
+        for (var i = 0; i < count; i++)
+            Normalize(destination.AsSpan((destinationIndex + i) * Dim, Dim));
     }
 
-    private static void Normalize(float[] v)
+    private static void Normalize(Span<float> v)
     {
         double sum = 0;
         foreach (var x in v) sum += (double)x * x;
@@ -157,5 +259,9 @@ internal sealed class Embedder : IDisposable
         for (var i = 0; i < v.Length; i++) v[i] = (float)(v[i] / norm);
     }
 
-    public void Dispose() => _session.Dispose();
+    public void Dispose()
+    {
+        _session.Dispose();
+        _tokenizers.Dispose();
+    }
 }
