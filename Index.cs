@@ -6,24 +6,41 @@ namespace MemFind;
 
 internal sealed class IndexItem
 {
-    [JsonPropertyName("file")] public string File { get; set; } = "";
-    [JsonPropertyName("theme")] public string Theme { get; set; } = "";
-    [JsonPropertyName("title")] public string Title { get; set; } = "";
-    [JsonPropertyName("description")] public string Description { get; set; } = "";
-    [JsonPropertyName("vec")] public float[] Vec { get; set; } = [];
+    [JsonPropertyName("file")]
+    public string File { get; set; } = "";
+
+    [JsonPropertyName("theme")]
+    public string Theme { get; set; } = "";
+
+    [JsonPropertyName("title")]
+    public string Title { get; set; } = "";
+
+    [JsonPropertyName("description")]
+    public string Description { get; set; } = "";
+
+    [JsonPropertyName("vec")]
+    public float[] Vec { get; set; } = [];
 }
 
 internal sealed class IndexFile
 {
-    [JsonPropertyName("model")] public string Model { get; set; } = Embedder.ModelName;
-    [JsonPropertyName("dim")] public int Dim { get; set; } = Embedder.Dim;
-    [JsonPropertyName("builtAt")] public string BuiltAt { get; set; } = "";
-    [JsonPropertyName("items")] public List<IndexItem> Items { get; set; } = [];
+    [JsonPropertyName("model")]
+    public string Model { get; set; } = Embedder.ModelName;
+
+    [JsonPropertyName("dim")]
+    public int Dim { get; set; } = Embedder.Dim;
+
+    [JsonPropertyName("builtAt")]
+    public string BuiltAt { get; set; } = "";
+
+    [JsonPropertyName("items")]
+    public List<IndexItem> Items { get; set; } = [];
 }
 
 internal static class Index
 {
-    public static string PathFor(string root) => System.IO.Path.Combine(root, ".memfind", "index.json");
+    public static string PathFor(string root) =>
+        System.IO.Path.Combine(root, ".memfind", "index.json");
 
     public static int Build(string root, bool int8)
     {
@@ -38,17 +55,23 @@ internal static class Index
 
         using var embedder = Embedder.Load(int8);
 
-        var index = new IndexFile { Model = embedder.Model, BuiltAt = DateTime.UtcNow.ToString("o") };
+        var index = new IndexFile
+        {
+            Model = embedder.Model,
+            BuiltAt = DateTime.UtcNow.ToString("o"),
+        };
         foreach (var doc in docs)
         {
-            index.Items.Add(new IndexItem
-            {
-                File = doc.File,
-                Theme = doc.Theme,
-                Title = doc.Title,
-                Description = doc.Description,
-                Vec = embedder.EmbedDocument(doc.Text),
-            });
+            index.Items.Add(
+                new IndexItem
+                {
+                    File = doc.File,
+                    Theme = doc.Theme,
+                    Title = doc.Title,
+                    Description = doc.Description,
+                    Vec = embedder.EmbedDocument(doc.Text),
+                }
+            );
         }
 
         var dir = System.IO.Path.Combine(root, ".memfind");
@@ -57,11 +80,13 @@ internal static class Index
         File.WriteAllText(PathFor(root), JsonSerializer.Serialize(index, Ctx.Default.IndexFile));
 
         sw.Stop();
-        Console.Error.WriteLine($"indexed {index.Items.Count} memories in {sw.Elapsed.TotalSeconds:F1} s -> {PathFor(root)}");
+        Console.Error.WriteLine(
+            $"indexed {index.Items.Count} memories in {sw.Elapsed.TotalSeconds:F1} s -> {PathFor(root)}"
+        );
         return 0;
     }
 
-    public static int Search(string root, string query, int k)
+    public static int Search(string root, string query, int k, bool json)
     {
         var path = PathFor(root);
         if (!File.Exists(path))
@@ -80,18 +105,40 @@ internal static class Index
         using var embedder = Embedder.Load(index.Model != Embedder.Fp32ModelName);
         var q = embedder.EmbedQuery(query);
 
-        var hits = index.Items
-            .Select(item => (Item: item, Score: Dot(q, item.Vec)))
+        var hits = index
+            .Items.Select(item => (Item: item, Score: Dot(q, item.Vec)))
             .OrderByDescending(h => h.Score)
             .Take(k)
             .ToList();
+
+        if (json)
+        {
+            using var output = new JsonLines();
+            foreach (var (item, score) in hits)
+            {
+                var writer = output.Writer;
+                writer.WriteStartObject();
+                writer.WriteString("source"u8, "memory");
+                writer.WriteNumber("score"u8, Math.Round(score, 4));
+                writer.WriteString("file"u8, item.File);
+                writer.WriteString("theme"u8, item.Theme);
+                writer.WriteString("title"u8, item.Title);
+                writer.WriteString("description"u8, item.Description);
+                writer.WriteEndObject();
+                output.Flush();
+            }
+
+            return 0;
+        }
 
         var themeWidth = hits.Count == 0 ? 0 : hits.Max(h => h.Item.Theme.Length);
         var fileWidth = hits.Count == 0 ? 0 : hits.Max(h => h.Item.File.Length);
 
         foreach (var (item, score) in hits)
         {
-            Console.WriteLine($"{score:F3}  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}   {item.Title}");
+            Console.WriteLine(
+                $"{score:F3}  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}   {item.Title}"
+            );
             Console.WriteLine($"       {Truncate(item.Description, 160)}");
         }
 
@@ -102,7 +149,8 @@ internal static class Index
     {
         var n = Math.Min(a.Length, b.Length);
         float sum = 0;
-        for (var i = 0; i < n; i++) sum += a[i] * b[i];
+        for (var i = 0; i < n; i++)
+            sum += a[i] * b[i];
         return sum;
     }
 

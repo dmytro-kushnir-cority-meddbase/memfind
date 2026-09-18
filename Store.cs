@@ -8,16 +8,20 @@ internal sealed record MemoryDoc(
     string Title,
     string Description,
     string Hook,
-    string Type)
+    string Type
+)
 {
     public string Text
     {
         get
         {
             var parts = new List<string>(3);
-            if (!string.IsNullOrWhiteSpace(Title)) parts.Add(Title.Trim());
-            if (!string.IsNullOrWhiteSpace(Description)) parts.Add(Description.Trim());
-            if (!string.IsNullOrWhiteSpace(Hook)) parts.Add(Hook.Trim());
+            if (!string.IsNullOrWhiteSpace(Title))
+                parts.Add(Title.Trim());
+            if (!string.IsNullOrWhiteSpace(Description))
+                parts.Add(Description.Trim());
+            if (!string.IsNullOrWhiteSpace(Hook))
+                parts.Add(Hook.Trim());
             return string.Join(". ", parts);
         }
     }
@@ -32,10 +36,15 @@ internal static class Store
         var placement = BuildPlacement(root);
         var docs = new List<MemoryDoc>();
 
-        foreach (var path in Directory.GetFiles(root, "*.md", SearchOption.TopDirectoryOnly).OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
+        foreach (
+            var path in Directory
+                .GetFiles(root, "*.md", SearchOption.TopDirectoryOnly)
+                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+        )
         {
             var fileName = Path.GetFileName(path);
-            if (string.Equals(fileName, "MEMORY.md", StringComparison.OrdinalIgnoreCase)) continue;
+            if (string.Equals(fileName, "MEMORY.md", StringComparison.OrdinalIgnoreCase))
+                continue;
 
             var (name, description, type) = ReadFrontMatter(path);
             var title = name;
@@ -45,11 +54,13 @@ internal static class Store
             if (placement.TryGetValue(fileName, out var p))
             {
                 theme = p.Theme;
-                if (!string.IsNullOrWhiteSpace(p.Title)) title = p.Title;
+                if (!string.IsNullOrWhiteSpace(p.Title))
+                    title = p.Title;
                 hook = p.Hook;
             }
 
-            if (string.IsNullOrWhiteSpace(title)) title = Path.GetFileNameWithoutExtension(fileName);
+            if (string.IsNullOrWhiteSpace(title))
+                title = Path.GetFileNameWithoutExtension(fileName);
 
             docs.Add(new MemoryDoc(fileName, theme, title, description, hook, type));
         }
@@ -66,7 +77,9 @@ internal static class Store
         var indexDir = Path.Combine(root, "index");
         if (Directory.Exists(indexDir))
         {
-            foreach (var indexFile in Directory.GetFiles(indexDir, "*.md", SearchOption.TopDirectoryOnly))
+            foreach (
+                var indexFile in Directory.GetFiles(indexDir, "*.md", SearchOption.TopDirectoryOnly)
+            )
             {
                 var theme = Path.GetFileNameWithoutExtension(indexFile);
                 Scan(indexFile, theme, "../", map);
@@ -74,26 +87,35 @@ internal static class Store
         }
 
         var memoryIndex = Path.Combine(root, "MEMORY.md");
-        if (File.Exists(memoryIndex)) Scan(memoryIndex, "MEMORY", "", map);
+        if (File.Exists(memoryIndex))
+            Scan(memoryIndex, "MEMORY", "", map);
 
         return map;
     }
 
     private static readonly Regex LinkRe = new(
         @"\[([^\]]*)\]\((?<prefix>\.\./)?(?<file>[A-Za-z0-9_.\-]+\.md)\)",
-        RegexOptions.Compiled);
+        RegexOptions.Compiled
+    );
 
-    private static void Scan(string indexPath, string theme, string expectedPrefix, Dictionary<string, Placement> map)
+    private static void Scan(
+        string indexPath,
+        string theme,
+        string expectedPrefix,
+        Dictionary<string, Placement> map
+    )
     {
         foreach (var line in ReadLines(indexPath))
         {
             foreach (Match m in LinkRe.Matches(line))
             {
                 var prefix = m.Groups["prefix"].Success ? "../" : "";
-                if (prefix != expectedPrefix) continue;
+                if (prefix != expectedPrefix)
+                    continue;
 
                 var file = m.Groups["file"].Value;
-                if (map.ContainsKey(file)) continue;
+                if (map.ContainsKey(file))
+                    continue;
 
                 var title = m.Groups[1].Value.Trim();
                 var hook = line[(m.Index + m.Length)..].Trim();
@@ -127,12 +149,14 @@ internal static class Store
         var type = "";
 
         var lines = ReadLines(path);
-        if (lines.Count == 0 || lines[0].Trim() != "---") return (name, description, type);
+        if (lines.Count == 0 || lines[0].Trim() != "---")
+            return (name, description, type);
 
         for (var i = 1; i < lines.Count; i++)
         {
             var line = lines[i];
-            if (line.Trim() == "---") break;
+            if (line.Trim() == "---")
+                break;
 
             if (line.StartsWith("name:", StringComparison.Ordinal))
             {
@@ -145,7 +169,8 @@ internal static class Store
             else
             {
                 var m = TypeRe.Match(line);
-                if (m.Success && type.Length == 0) type = Unquote(m.Groups["v"].Value);
+                if (m.Success && type.Length == 0)
+                    type = Unquote(m.Groups["v"].Value);
             }
         }
 
@@ -155,7 +180,8 @@ internal static class Store
     private static string Unquote(string s)
     {
         s = s.Trim();
-        if (s.Length >= 2 && s[0] == '"' && s[^1] == '"') s = s[1..^1];
+        if (s.Length >= 2 && s[0] == '"' && s[^1] == '"')
+            s = s[1..^1];
         return s.Trim();
     }
 
