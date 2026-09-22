@@ -25,10 +25,10 @@ internal sealed class IndexItem
 internal sealed class IndexFile
 {
     [JsonPropertyName("model")]
-    public string Model { get; set; } = Embedder.ModelName;
+    public string Model { get; set; } = "";
 
     [JsonPropertyName("dim")]
-    public int Dim { get; set; } = Embedder.Dim;
+    public int Dim { get; set; }
 
     [JsonPropertyName("builtAt")]
     public string BuiltAt { get; set; } = "";
@@ -39,10 +39,13 @@ internal sealed class IndexFile
 
 internal static class Index
 {
-    public static string PathFor(string root) =>
-        System.IO.Path.Combine(root, ".memfind", "index.json");
+    /// <summary>Rank-fusion constant; the models' cosines are on different scales, so only ranks fuse.</summary>
+    public const float RrfK = 60f;
 
-    public static int Build(string root, bool int8)
+    public static string PathFor(string root, ModelSpec spec) =>
+        System.IO.Path.Combine(root, ".memfind", $"index{spec.Suffix}.json");
+
+    public static int Build(string root, ModelSpec spec, bool gpu)
     {
         if (!Directory.Exists(root))
         {
@@ -53,11 +56,12 @@ internal static class Index
         var sw = Stopwatch.StartNew();
         var docs = Store.Parse(root);
 
-        using var embedder = Embedder.Load(int8);
+        using var embedder = Embedder.Load(spec, gpu);
 
         var index = new IndexFile
         {
             Model = embedder.Model,
+            Dim = embedder.Dim,
             BuiltAt = DateTime.UtcNow.ToString("o"),
         };
         foreach (var doc in docs)
@@ -77,39 +81,58 @@ internal static class Index
         var dir = System.IO.Path.Combine(root, ".memfind");
         Directory.CreateDirectory(dir);
         File.WriteAllText(System.IO.Path.Combine(dir, ".gitignore"), "*\n");
-        File.WriteAllText(PathFor(root), JsonSerializer.Serialize(index, Ctx.Default.IndexFile));
+        File.WriteAllText(
+            PathFor(root, spec),
+            JsonSerializer.Serialize(index, Ctx.Default.IndexFile)
+        );
 
         sw.Stop();
         Console.Error.WriteLine(
-            $"indexed {index.Items.Count} memories in {sw.Elapsed.TotalSeconds:F1} s -> {PathFor(root)}"
+            $"indexed {index.Items.Count} memories in {sw.Elapsed.TotalSeconds:F1} s -> {PathFor(root, spec)}"
         );
         return 0;
     }
 
-    public static int Search(string root, string query, int k, bool json)
+    private static List<(IndexItem Item, float Score)>? Rank(
+        string root,
+        ModelSpec spec,
+        string query,
+        int k
+    )
     {
-        var path = PathFor(root);
-        if (!File.Exists(path))
-        {
-            Console.Error.WriteLine("no index — run: memfind index");
-            return 1;
-        }
+        var path = PathFor(root, spec);
+        var index = File.Exists(path)
+            ? JsonSerializer.Deserialize(File.ReadAllText(path), Ctx.Default.IndexFile)
+            : null;
 
-        var index = JsonSerializer.Deserialize(File.ReadAllText(path), Ctx.Default.IndexFile);
         if (index is null || index.Items.Count == 0)
         {
-            Console.Error.WriteLine("no index — run: memfind index");
-            return 1;
+            Console.Error.WriteLine(
+                spec.Suffix.Length == 0
+                    ? "no index — run: memfind index"
+                    : $"no {spec.Key} index — run: memfind index --model {spec.Key}"
+            );
+            return null;
         }
 
-        using var embedder = Embedder.Load(index.Model != Embedder.Fp32ModelName);
+        using var embedder = Embedder.Load(ModelSpec.ByName(index.Model) ?? spec);
         var q = embedder.EmbedQuery(query);
 
-        var hits = index
+        return index
             .Items.Select(item => (Item: item, Score: Dot(q, item.Vec)))
             .OrderByDescending(h => h.Score)
             .Take(k)
             .ToList();
+    }
+
+    public static int Search(string root, ModelSpec[] specs, string query, int k, bool json)
+    {
+        if (specs.Length > 1)
+            return SearchFused(root, specs, query, k, json);
+
+        var hits = Rank(root, specs[0], query, k);
+        if (hits is null)
+            return 1;
 
         if (json)
         {
@@ -143,6 +166,91 @@ internal static class Index
         }
 
         return 0;
+    }
+
+    private static int SearchFused(string root, ModelSpec[] specs, string query, int k, bool json)
+    {
+        var fused = new Dictionary<string, (IndexItem Item, float Score, List<Leg> Legs)>();
+        var legs = 0;
+
+        foreach (var spec in specs)
+        {
+            var hits = Rank(root, spec, query, 3 * k);
+            if (hits is null)
+                continue;
+            legs++;
+
+            for (var rank = 1; rank <= hits.Count; rank++)
+            {
+                var (item, score) = hits[rank - 1];
+                if (!fused.TryGetValue(item.File, out var entry))
+                    entry = (item, 0f, []);
+                entry.Legs.Add(new Leg(spec.Key, score, rank));
+                fused[item.File] = (entry.Item, entry.Score + 1f / (RrfK + rank), entry.Legs);
+            }
+        }
+
+        if (legs == 0)
+            return 1;
+
+        var rows = fused
+            .Values.OrderByDescending(h => h.Score)
+            .ThenBy(h => h.Item.File, StringComparer.Ordinal)
+            .Take(k)
+            .ToList();
+
+        if (json)
+        {
+            using var output = new JsonLines();
+            foreach (var (item, score, hitLegs) in rows)
+            {
+                var writer = output.Writer;
+                writer.WriteStartObject();
+                writer.WriteString("source"u8, "memory");
+                writer.WriteNumber("score"u8, Math.Round(score, 4));
+                writer.WriteString("file"u8, item.File);
+                writer.WriteString("theme"u8, item.Theme);
+                writer.WriteString("title"u8, item.Title);
+                writer.WriteString("description"u8, item.Description);
+                WriteLegs(writer, hitLegs);
+                writer.WriteEndObject();
+                output.Flush();
+            }
+
+            return 0;
+        }
+
+        var themeWidth = rows.Count == 0 ? 0 : rows.Max(h => h.Item.Theme.Length);
+        var fileWidth = rows.Count == 0 ? 0 : rows.Max(h => h.Item.File.Length);
+
+        foreach (var (item, score, hitLegs) in rows)
+        {
+            Console.WriteLine(
+                $"{score:F3}  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}   {item.Title}   [{Describe(hitLegs)}]"
+            );
+            Console.WriteLine($"       {Truncate(item.Description, 160)}");
+        }
+
+        return 0;
+    }
+
+    internal readonly record struct Leg(string Model, float Score, int Rank);
+
+    internal static string Describe(List<Leg> legs) =>
+        string.Join(' ', legs.Select(l => $"{l.Model} #{l.Rank} {l.Score:F3}"));
+
+    internal static void WriteLegs(Utf8JsonWriter writer, List<Leg> legs)
+    {
+        writer.WriteStartArray("models"u8);
+        foreach (var leg in legs)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("model"u8, leg.Model);
+            writer.WriteNumber("score"u8, Math.Round(leg.Score, 4));
+            writer.WriteNumber("rank"u8, leg.Rank);
+            writer.WriteEndObject();
+        }
+        writer.WriteEndArray();
     }
 
     private static float Dot(float[] a, float[] b)

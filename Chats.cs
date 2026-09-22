@@ -196,7 +196,10 @@ internal static class Chats
                     Line = number,
                     Chunk = i,
                     Preview = chunk.Length <= PreviewChars ? chunk : chunk[..PreviewChars],
-                    Tokens = embedder.Encode(chunk, Embedder.ChatMaxTokens),
+                    Tokens = embedder.Encode(
+                        embedder.Spec.DocPrefix + chunk,
+                        embedder.Spec.ChatMaxTokens
+                    ),
                 }
             );
         }

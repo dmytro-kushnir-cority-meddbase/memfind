@@ -35,7 +35,7 @@ internal sealed class ChatState
     public string Model { get; set; } = "";
 
     [JsonPropertyName("dim")]
-    public int Dim { get; set; } = Embedder.Dim;
+    public int Dim { get; set; }
 
     [JsonPropertyName("metaVersion")]
     public int MetaVersion { get; set; }
@@ -49,31 +49,30 @@ internal sealed class ChatState
 
 internal static class ChatIndex
 {
-    private const int VectorBytes = Embedder.Dim * sizeof(float);
-
     /// <summary>Layout of chats.meta.jsonl; a lower value in chats.state.json is refused at search time.</summary>
     public const int MetaVersion = 2;
 
     public static string Dir(string root) => System.IO.Path.Combine(root, ".memfind");
 
-    public static string VecPath(string root) => System.IO.Path.Combine(Dir(root), "chats.vec");
+    public static string VecPath(string root, ModelSpec spec) =>
+        System.IO.Path.Combine(Dir(root), $"chats{spec.Suffix}.vec");
 
-    public static string MetaPath(string root) =>
-        System.IO.Path.Combine(Dir(root), "chats.meta.jsonl");
+    public static string MetaPath(string root, ModelSpec spec) =>
+        System.IO.Path.Combine(Dir(root), $"chats{spec.Suffix}.meta.jsonl");
 
-    public static string StatePath(string root) =>
-        System.IO.Path.Combine(Dir(root), "chats.state.json");
+    public static string StatePath(string root, ModelSpec spec) =>
+        System.IO.Path.Combine(Dir(root), $"chats{spec.Suffix}.state.json");
 
-    public static ChatState LoadState(string root)
+    public static ChatState LoadState(string root, ModelSpec spec)
     {
-        var path = StatePath(root);
+        var path = StatePath(root, spec);
         if (!File.Exists(path))
             return new ChatState();
         return JsonSerializer.Deserialize(File.ReadAllText(path), Ctx.Default.ChatState)
             ?? new ChatState();
     }
 
-    public static int Build(string root, bool rebuild, bool includeAgents, bool int8)
+    public static int Build(string root, bool rebuild, bool includeAgents, ModelSpec spec, bool gpu)
     {
         var projects = Chats.ProjectsRoot;
         if (!Directory.Exists(projects))
@@ -86,13 +85,13 @@ internal static class ChatIndex
         Directory.CreateDirectory(dir);
         File.WriteAllText(System.IO.Path.Combine(dir, ".gitignore"), "*\n");
 
-        var model = int8 ? Embedder.Int8ModelName : Embedder.Fp32ModelName;
-        var state = rebuild ? new ChatState() : LoadState(root);
+        var vectorBytes = spec.Dim * sizeof(float);
+        var state = rebuild ? new ChatState() : LoadState(root, spec);
 
         if (
             state.Files.Count > 0
             && (
-                state.Model != model
+                state.Model != spec.Name
                 || state.IncludeAgents != includeAgents
                 || state.MetaVersion != MetaVersion
             )
@@ -106,17 +105,18 @@ internal static class ChatIndex
             state = new ChatState();
         }
 
-        state.Model = model;
+        state.Model = spec.Name;
+        state.Dim = spec.Dim;
         state.IncludeAgents = includeAgents;
         state.MetaVersion = MetaVersion;
 
         if (rebuild)
         {
             state.Files.Clear();
-            if (File.Exists(VecPath(root)))
-                File.Delete(VecPath(root));
-            if (File.Exists(MetaPath(root)))
-                File.Delete(MetaPath(root));
+            if (File.Exists(VecPath(root, spec)))
+                File.Delete(VecPath(root, spec));
+            if (File.Exists(MetaPath(root, spec)))
+                File.Delete(MetaPath(root, spec));
         }
 
         var total = Stopwatch.StartNew();
@@ -177,14 +177,14 @@ internal static class ChatIndex
         if (dropped.Count > 0)
         {
             Console.Error.WriteLine($"re-indexing {dropped.Count} changed/removed transcript(s)");
-            Compact(root, state, dropped);
+            Compact(root, spec, state, dropped);
         }
 
-        var existing = File.Exists(VecPath(root))
-            ? new FileInfo(VecPath(root)).Length / VectorBytes
+        var existing = File.Exists(VecPath(root, spec))
+            ? new FileInfo(VecPath(root, spec)).Length / vectorBytes
             : 0;
 
-        using var embedder = Embedder.Load(int8);
+        using var embedder = Embedder.Load(spec, gpu);
 
         var parse = Stopwatch.StartNew();
         var results = new ParseResult[work.Count];
@@ -263,7 +263,7 @@ internal static class ChatIndex
             for (var i = 0; i < items.Count; i++)
                 tokens[i] = items[i].Tokens;
 
-            var vectors = new float[(long)items.Count * Embedder.Dim];
+            var vectors = new float[(long)items.Count * spec.Dim];
             var embed = Stopwatch.StartNew();
             var reported = 0;
             embedder.EmbedMany(
@@ -287,17 +287,20 @@ internal static class ChatIndex
                     + $"1 session x {embedder.IntraOpThreads} intra-op threads)"
             );
 
-            AppendVectors(VecPath(root), vectors);
-            AppendMeta(MetaPath(root), items, existing);
+            AppendVectors(VecPath(root, spec), vectors);
+            AppendMeta(MetaPath(root, spec), items, existing);
         }
 
-        File.WriteAllText(StatePath(root), JsonSerializer.Serialize(state, Ctx.Default.ChatState));
+        File.WriteAllText(
+            StatePath(root, spec),
+            JsonSerializer.Serialize(state, Ctx.Default.ChatState)
+        );
 
         total.Stop();
         Console.Error.WriteLine(
             $"chats: {next} items, {state.Files.Count} file record(s), "
-                + $"{Size(VecPath(root)) / 1048576} MB vectors, "
-                + $"{Size(MetaPath(root)) / 1048576} MB metadata "
+                + $"{Size(VecPath(root, spec)) / 1048576} MB vectors, "
+                + $"{Size(MetaPath(root, spec)) / 1048576} MB metadata "
                 + $"in {total.Elapsed.TotalSeconds:F1} s"
         );
 
@@ -366,8 +369,15 @@ internal static class ChatIndex
         writer.Flush();
     }
 
-    private static void Compact(string root, ChatState state, HashSet<string> dropped)
+    private static void Compact(
+        string root,
+        ModelSpec spec,
+        ChatState state,
+        HashSet<string> dropped
+    )
     {
+        var vectorBytes = spec.Dim * sizeof(float);
+
         var survivors = state
             .Files.Where(f => !dropped.Contains(f.Path))
             .OrderBy(f => f.ItemsFrom)
@@ -375,8 +385,8 @@ internal static class ChatIndex
 
         state.Files = survivors;
 
-        var vec = VecPath(root);
-        var meta = MetaPath(root);
+        var vec = VecPath(root, spec);
+        var meta = MetaPath(root, spec);
         if (!File.Exists(vec))
             return;
 
@@ -405,8 +415,8 @@ internal static class ChatIndex
             var buffer = new byte[1 << 20];
             foreach (var record in keep)
             {
-                source.Position = record.ItemsFrom * VectorBytes;
-                var remaining = (long)record.ItemsCount * VectorBytes;
+                source.Position = record.ItemsFrom * vectorBytes;
+                var remaining = (long)record.ItemsCount * vectorBytes;
                 while (remaining > 0)
                 {
                     var n = source.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining));
@@ -484,25 +494,31 @@ internal static class ChatIndex
         }
     }
 
-    public static unsafe int Search(string root, string query, int k, bool json)
+    private static unsafe List<Row>? Rows(string root, ModelSpec spec, string query, int k)
     {
-        var vec = VecPath(root);
+        var vec = VecPath(root, spec);
         if (!File.Exists(vec) || new FileInfo(vec).Length == 0)
         {
-            Console.Error.WriteLine("no chat index — run: memfind index --chats-only");
-            return 1;
+            Console.Error.WriteLine(
+                spec.Suffix.Length == 0
+                    ? "no chat index — run: memfind index --chats-only"
+                    : $"no {spec.Key} chat index — run: memfind index --model {spec.Key} --chats-only"
+            );
+            return null;
         }
 
-        var state = LoadState(root);
+        var state = LoadState(root, spec);
         if (state.MetaVersion != MetaVersion)
         {
             Console.Error.WriteLine("chats.meta.jsonl is old — run: memfind index --rebuild");
-            return 1;
+            return null;
         }
 
-        var count = (int)(new FileInfo(vec).Length / VectorBytes);
+        var loaded = ModelSpec.ByName(state.Model) ?? spec;
+        var vectorBytes = loaded.Dim * sizeof(float);
+        var count = (int)(new FileInfo(vec).Length / vectorBytes);
 
-        using var embedder = Embedder.Load(state.Model != Embedder.Fp32ModelName);
+        using var embedder = Embedder.Load(loaded);
         var q = embedder.EmbedQuery(query);
 
         var heap = new TopK(k);
@@ -525,8 +541,8 @@ internal static class ChatIndex
                 for (var i = 0; i < count; i++)
                 {
                     var row = new ReadOnlySpan<float>(
-                        pointer + (long)i * VectorBytes,
-                        Embedder.Dim
+                        pointer + (long)i * vectorBytes,
+                        loaded.Dim
                     );
                     heap.Add(TensorPrimitives.Dot(q.AsSpan(), row), i);
                 }
@@ -538,7 +554,7 @@ internal static class ChatIndex
         }
 
         var hits = heap.Sorted();
-        var meta = ReadMeta(MetaPath(root), hits.Select(h => h.Index).ToHashSet());
+        var meta = ReadMeta(MetaPath(root, spec), hits.Select(h => h.Index).ToHashSet());
 
         var rows = new List<Row>();
         foreach (var (score, index) in hits)
@@ -575,6 +591,18 @@ internal static class ChatIndex
             );
         }
 
+        return rows;
+    }
+
+    public static int Search(string root, ModelSpec[] specs, string query, int k, bool json)
+    {
+        if (specs.Length > 1)
+            return SearchFused(root, specs, query, k, json);
+
+        var rows = Rows(root, specs[0], query, k);
+        if (rows is null)
+            return 1;
+
         if (json)
         {
             using var output = new JsonLines();
@@ -600,19 +628,90 @@ internal static class ChatIndex
             return 0;
         }
 
-        var roleWidth = rows.Count == 0 ? 0 : rows.Max(r => r.Role.Length);
-        var slugWidth = rows.Count == 0 ? 0 : rows.Max(r => r.Slug.Length);
+        Print(rows.Select(r => (r, r.Score, (List<Index.Leg>?)null)).ToList());
+        return 0;
+    }
 
-        foreach (var row in rows)
+    private static int SearchFused(string root, ModelSpec[] specs, string query, int k, bool json)
+    {
+        var fused = new Dictionary<
+            (string Path, long Line, int Chunk),
+            (Row Row, float Score, List<Index.Leg> Legs)
+        >();
+        var legs = 0;
+
+        foreach (var spec in specs)
+        {
+            var rows = Rows(root, spec, query, 3 * k);
+            if (rows is null)
+                continue;
+            legs++;
+
+            for (var rank = 1; rank <= rows.Count; rank++)
+            {
+                var row = rows[rank - 1];
+                var key = (row.Path, row.Line, row.Chunk);
+                if (!fused.TryGetValue(key, out var entry))
+                    entry = (row, 0f, []);
+                entry.Legs.Add(new Index.Leg(spec.Key, row.Score, rank));
+                fused[key] = (entry.Row, entry.Score + 1f / (Index.RrfK + rank), entry.Legs);
+            }
+        }
+
+        if (legs == 0)
+            return 1;
+
+        var hits = fused
+            .Values.OrderByDescending(h => h.Score)
+            .ThenBy(h => h.Row.Path, StringComparer.Ordinal)
+            .ThenBy(h => h.Row.Line)
+            .Take(k)
+            .ToList();
+
+        if (json)
+        {
+            using var output = new JsonLines();
+            foreach (var (row, score, hitLegs) in hits)
+            {
+                var writer = output.Writer;
+                writer.WriteStartObject();
+                writer.WriteString("source"u8, "chat");
+                writer.WriteNumber("score"u8, Math.Round(score, 4));
+                writer.WriteString("file"u8, row.Path);
+                writer.WriteNumber("line"u8, row.Line);
+                writer.WriteString("uuid"u8, row.Uuid);
+                writer.WriteNumber("chunk"u8, row.Chunk);
+                writer.WriteString("session"u8, row.Session);
+                writer.WriteString("cwd"u8, row.Cwd);
+                writer.WriteString("role"u8, row.Role);
+                writer.WriteString("ts"u8, row.Ts);
+                writer.WriteString("text"u8, row.Text);
+                Index.WriteLegs(writer, hitLegs);
+                writer.WriteEndObject();
+                output.Flush();
+            }
+
+            return 0;
+        }
+
+        Print(hits.Select(h => (h.Row, h.Score, (List<Index.Leg>?)h.Legs)).ToList());
+        return 0;
+    }
+
+    private static void Print(List<(Row Row, float Score, List<Index.Leg>? Legs)> hits)
+    {
+        var roleWidth = hits.Count == 0 ? 0 : hits.Max(h => h.Row.Role.Length);
+        var slugWidth = hits.Count == 0 ? 0 : hits.Max(h => h.Row.Slug.Length);
+
+        foreach (var (row, score, legs) in hits)
         {
             Console.WriteLine(
-                $"{row.Score:F3}  {row.Time}  {row.Role.PadRight(roleWidth)}   {row.Slug.PadRight(slugWidth)}   {row.ShortSession}"
+                $"{score:F3}  {row.Time}  {row.Role.PadRight(roleWidth)}   {row.Slug.PadRight(slugWidth)}   {row.ShortSession}"
+                    + (legs is null ? "" : $"   [{Index.Describe(legs)}]")
             );
             Console.WriteLine($"       {row.Path}:{row.Line}");
             Console.WriteLine($"       {Truncate(row.Text, 160)}");
         }
-
-        return 0;
     }
 
     private readonly record struct Row(
