@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -17,6 +19,9 @@ internal sealed class IndexItem
 
     [JsonPropertyName("description")]
     public string Description { get; set; } = "";
+
+    [JsonPropertyName("textHash")]
+    public string TextHash { get; set; } = "";
 
     [JsonPropertyName("vec")]
     public float[] Vec { get; set; } = [];
@@ -56,42 +61,122 @@ internal static class Index
         var sw = Stopwatch.StartNew();
         var docs = Store.Parse(root);
 
-        using var embedder = Embedder.Load(spec, gpu);
+        var path = PathFor(root, spec);
+        var old = LoadExisting(path);
+        var reusable = BuildReusable(old, spec);
 
-        var index = new IndexFile
-        {
-            Model = embedder.Model,
-            Dim = embedder.Dim,
-            BuiltAt = DateTime.UtcNow.ToString("o"),
-        };
+        var items = new List<IndexItem>(docs.Count);
+        var pending = new List<(int Index, string Text)>();
+
         foreach (var doc in docs)
         {
-            index.Items.Add(
-                new IndexItem
-                {
-                    File = doc.File,
-                    Theme = doc.Theme,
-                    Title = doc.Title,
-                    Description = doc.Description,
-                    Vec = embedder.EmbedDocument(doc.Text),
-                }
-            );
+            var hash = HashText(doc.Text);
+            var item = new IndexItem
+            {
+                File = doc.File,
+                Theme = doc.Theme,
+                Title = doc.Title,
+                Description = doc.Description,
+                TextHash = hash,
+            };
+
+            if (reusable is not null && reusable.TryGetValue((doc.File, hash), out var reused))
+                item.Vec = reused.Vec;
+            else
+                pending.Add((items.Count, doc.Text));
+
+            items.Add(item);
+        }
+
+        if (pending.Count > 0)
+        {
+            using var embedder = Embedder.Load(spec, gpu);
+            foreach (var (i, text) in pending)
+                items[i].Vec = embedder.EmbedDocument(text);
         }
 
         var dir = System.IO.Path.Combine(root, ".memfind");
         Directory.CreateDirectory(dir);
         File.WriteAllText(System.IO.Path.Combine(dir, ".gitignore"), "*\n");
-        File.WriteAllText(
-            PathFor(root, spec),
-            JsonSerializer.Serialize(index, Ctx.Default.IndexFile)
-        );
+
+        if (pending.Count == 0 && old is not null && SameItems(old.Items, items))
+        {
+            sw.Stop();
+            Console.Error.WriteLine($"memories unchanged ({items.Count}) -> {path}");
+            return 0;
+        }
+
+        var index = new IndexFile
+        {
+            Model = spec.Name,
+            Dim = spec.Dim,
+            BuiltAt = DateTime.UtcNow.ToString("o"),
+            Items = items,
+        };
+
+        var tmp = path + ".tmp";
+        File.WriteAllText(tmp, JsonSerializer.Serialize(index, Ctx.Default.IndexFile));
+        File.Move(tmp, path, overwrite: true);
 
         sw.Stop();
         Console.Error.WriteLine(
-            $"indexed {index.Items.Count} memories in {sw.Elapsed.TotalSeconds:F1} s -> {PathFor(root, spec)}"
+            $"indexed {items.Count} memories ({pending.Count} embedded, {items.Count - pending.Count} reused) in {sw.Elapsed.TotalSeconds:F1} s -> {path}"
         );
         return 0;
     }
+
+    private static IndexFile? LoadExisting(string path)
+    {
+        if (!File.Exists(path))
+            return null;
+        try
+        {
+            return JsonSerializer.Deserialize(File.ReadAllText(path), Ctx.Default.IndexFile);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Old items keyed by (File, TextHash); items missing textHash (old format) never match.</summary>
+    private static Dictionary<(string File, string Hash), IndexItem>? BuildReusable(
+        IndexFile? old,
+        ModelSpec spec
+    )
+    {
+        if (old is null || old.Model != spec.Name || old.Dim != spec.Dim)
+            return null;
+
+        var map = new Dictionary<(string, string), IndexItem>();
+        foreach (var item in old.Items)
+            if (item.TextHash.Length > 0)
+                map.TryAdd((item.File, item.TextHash), item);
+        return map;
+    }
+
+    private static bool SameItems(List<IndexItem> a, List<IndexItem> b)
+    {
+        if (a.Count != b.Count)
+            return false;
+        for (var i = 0; i < a.Count; i++)
+        {
+            var x = a[i];
+            var y = b[i];
+            if (
+                x.File != y.File
+                || x.Theme != y.Theme
+                || x.Title != y.Title
+                || x.Description != y.Description
+                || x.TextHash != y.TextHash
+            )
+                return false;
+        }
+        return true;
+    }
+
+    private static string HashText(string text) =>
+        Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
 
     private static List<(IndexItem Item, float Score)>? Rank(
         string root,
