@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using Microsoft.ML.Tokenizers;
@@ -139,12 +140,13 @@ internal sealed class Embedder : IDisposable
     public const int BatchSize = 64;
 
     private static int _threads = Math.Max(1, Environment.ProcessorCount / 2);
+    private static int _queryThreads = 4;
 
     /// <summary>Intra-op threads per session and the degree of parallelism used while parsing.</summary>
     public static int Threads
     {
         get => _threads;
-        set => _threads = Math.Max(1, value);
+        set => _threads = _queryThreads = Math.Max(1, value);
     }
 
     /// <summary>
@@ -159,6 +161,8 @@ internal sealed class Embedder : IDisposable
     private readonly string _outputName;
     private readonly int _sepId;
     private readonly int _padId;
+    private string? _query;
+    private float[] _queryVector = [];
 
     public ModelSpec Spec { get; }
     public string Model => Spec.Name;
@@ -204,7 +208,38 @@ internal sealed class Embedder : IDisposable
         _padId = spec.PadId;
     }
 
-    public static Embedder Load(ModelSpec spec, bool gpu = false)
+    /// <summary>Starts a background load of the query session for <paramref name="spec"/>, once.</summary>
+    public static void Preload(Dictionary<ModelSpec, Task<Embedder>> embedders, ModelSpec spec)
+    {
+        if (!embedders.ContainsKey(spec))
+            embedders[spec] = Task.Run(() => Load(spec, query: true));
+    }
+
+    /// <summary>The query session for <paramref name="spec"/>: the preloaded one, else loaded now.</summary>
+    public static Embedder ForQuery(Dictionary<ModelSpec, Task<Embedder>> embedders, ModelSpec spec)
+    {
+        if (!embedders.TryGetValue(spec, out var loading))
+            embedders[spec] = loading = Task.FromResult(Load(spec, query: true));
+        return loading.GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Waits for every load, used or not, so none is still inside ONNX Runtime at exit. A load
+    /// nothing used may fail silently; one a search used has already thrown there.
+    /// </summary>
+    public static void DisposeAll(Dictionary<ModelSpec, Task<Embedder>> embedders)
+    {
+        foreach (var loading in embedders.Values)
+        {
+            try
+            {
+                loading.GetAwaiter().GetResult().Dispose();
+            }
+            catch (Exception) when (loading.IsFaulted) { }
+        }
+    }
+
+    public static Embedder Load(ModelSpec spec, bool gpu = false, bool query = false)
     {
         var root = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -223,22 +258,95 @@ internal sealed class Embedder : IDisposable
                 EnsureFile(path, url);
         }
 
-        var threads = Threads;
+        var threads = query ? _queryThreads : Threads;
 
         var options = new SessionOptions();
         options.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
         options.IntraOpNumThreads = threads;
         options.InterOpNumThreads = 1;
+        if (query)
+            options.AddSessionConfigEntry("session.disable_prepacking", "1");
 
         if (gpu && TryEnableCuda(options))
             Console.Error.WriteLine("cuda enabled");
 
+        var model = Path.Combine(dir, spec.ModelFile);
         return new Embedder(
             spec,
-            new InferenceSession(Path.Combine(dir, spec.ModelFile), options),
+            query && !gpu && !spec.Files.Any(f => f.File.EndsWith(".onnx_data"))
+                ? LoadOptimized(model, options)
+                : new InferenceSession(model, options),
             threads,
             Path.Combine(dir, spec.TokenizerFile)
         );
+    }
+
+    /// <summary>
+    /// Loads model.optimized.onnx when model.optimized.key matches, else optimises the model and
+    /// saves both. memfind-rs reads and writes the same two files.
+    /// </summary>
+    private static InferenceSession LoadOptimized(string model, SessionOptions options)
+    {
+        var graph = Path.Combine(Path.GetDirectoryName(model)!, "model.optimized.onnx");
+        var keyPath = Path.ChangeExtension(graph, ".key");
+        var source = new FileInfo(model);
+        var key =
+            $"{source.Length} bytes, modified {(source.LastWriteTimeUtc - DateTime.UnixEpoch).Ticks * 100} ns, {BuildInfo()}";
+
+        try
+        {
+            if (File.Exists(keyPath) && File.Exists(graph) && File.ReadAllText(keyPath) == key)
+            {
+                options.GraphOptimizationLevel = GraphOptimizationLevel.ORT_DISABLE_ALL;
+                return new InferenceSession(graph, options);
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+
+        var partial = Path.ChangeExtension(graph, $".{Environment.ProcessId}.tmp");
+        options.OptimizedModelFilePath = partial;
+        // ORT warns that a graph saved at this level is tied to this CPU; the cache never leaves it.
+        options.LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR;
+        InferenceSession session;
+        try
+        {
+            session = new InferenceSession(model, options);
+        }
+        catch (Exception)
+        {
+            // An unwritable cache fails the session, and ORT codes the managed wrapper cannot map
+            // surface as KeyNotFoundException; a real model error recurs on this second load.
+            options.OptimizedModelFilePath = "";
+            return new InferenceSession(model, options);
+        }
+
+        try
+        {
+            File.Move(partial, graph, overwrite: true);
+            File.WriteAllText(keyPath, key);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            try
+            {
+                File.Delete(partial);
+            }
+            catch (Exception f) when (f is IOException or UnauthorizedAccessException) { }
+        }
+
+        return session;
+    }
+
+    [DllImport("onnxruntime")]
+    private static extern nint OrtGetApiBase();
+
+    private static unsafe string BuildInfo()
+    {
+        // OrtApiBase.GetApi, then OrtApi slot 254 = GetBuildInfoString (onnxruntime_c_api.h, since
+        // API 15); the managed API does not expose it.
+        var getApi = *(delegate* unmanaged<uint, nint*>*)OrtGetApiBase();
+        var api = getApi(15);
+        return Marshal.PtrToStringUTF8(((delegate* unmanaged<nint>)api[254])())!;
     }
 
     /// <summary>
@@ -391,7 +499,15 @@ internal sealed class Embedder : IDisposable
         return result;
     }
 
-    public float[] EmbedQuery(string query) => Embed(Spec.QueryPrefix + query);
+    public float[] EmbedQuery(string query)
+    {
+        if (query != _query)
+        {
+            _queryVector = Embed(Spec.QueryPrefix + query);
+            _query = query;
+        }
+        return _queryVector;
+    }
 
     public float[] EmbedDocument(string text) => Embed(Spec.DocPrefix + text);
 

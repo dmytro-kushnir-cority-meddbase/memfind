@@ -8,9 +8,9 @@ under `%USERPROFILE%\.claude\projects`. One NativeAOT exe, no service, no server
 | Command | What it does |
 | --- | --- |
 | `memfind index [options]` | Build both indexes into `<store>\.memfind\` |
-| `memfind <query words...>` | Search memories |
-| `memfind <query words...> --chats` | Search chat transcripts |
-| `memfind <query words...> --all` | Search both (memories first) |
+| `memfind <query words...>` | Search memories, chats and agent chats (memories first) |
+| `memfind <query words...> --chats` | Search chat transcripts only (main and agent) |
+| `memfind <query words...> --memories` | Search memories only |
 | `memfind show <file>:<line> [-c N]` | Print that transcript message in full, with neighbours |
 | `memfind stats` | What is indexed |
 | `memfind --help` | Usage |
@@ -26,14 +26,16 @@ builds each model in turn; on a query it searches with each and fuses the two ra
 | `-k N` | queries | Hits per source (default 5) |
 | `-c N` | `show` | Kept messages of context on each side (default 3) |
 | `--json` | queries, `show`, `stats` | JSONL instead of columns |
-| `--chats` / `--all` | queries | Which index to search |
+| `--chats` / `--chats-only` | queries | Search chat transcripts only (main and agent) |
+| `--memories` / `--memory-only` | queries | Search memories only; with `--chats` it is an error (exit 2) |
+| `--all` | queries | Search everything — the default, accepted for old callers |
 | `--chats-only` / `--memory-only` | `index` | Skip the other half |
 | `--rebuild` | `index` | Ignore the incremental state, re-read every transcript |
-| `--include-agents` | `index`, `show` | Index/keep subagent (sidechain) messages |
+| `--no-agents` | `index` | Skip subagent transcripts and sidechain messages (indexed by default; `--include-agents` is accepted and does nothing) |
 | `--model <name>` | `index`, queries, `stats` | `bge` (default), `bge-fp32`, `gemma`, or `both` |
 | `--fp32` | `index` | Alias for `--model bge-fp32`; with `--model both` it is an error (exit 2) |
 | `--gpu` | `index` | Try the CUDA execution provider, fall back to CPU |
-| `--threads N` | all | Intra-op and parse threads (default: half the cores) |
+| `--threads N` | all | Intra-op and parse threads (default: half the cores; a search uses 4 intra-op) |
 
 ## Exit codes
 
@@ -45,17 +47,22 @@ builds each model in turn; on a query it searches with each and fuses the two ra
 
 ## Output — text
 
+The first line of every hit starts with the score, then the source padded to six characters:
+`memory` (memory store), `chat` (a main session transcript) or `agent` (a subagent transcript,
+any path with a `subagents` directory, workflow agents included). A default search prints the
+memory hits, a blank line, then the chat and agent hits ranked together.
+
 Memory hit, two lines:
 
 ```
-0.611  workstation   feedback_unsigned_installers.md   Unsigned installers
+0.611  memory  workstation   feedback_unsigned_installers.md   Unsigned installers
        He cancels the UAC prompt on anything unsigned ...
 ```
 
 Chat hit, three lines — score row, anchor, preview:
 
 ```
-0.628  2026-09-15 08:51  assistant   c--Git   755e4845
+0.628  chat    2026-09-15 08:51  assistant   c--Git   755e4845
        C:\Users\me\.claude\projects\C--Git\755e4845-....jsonl:8412
        the 160-char preview, newlines collapsed ...
 ```
@@ -84,7 +91,7 @@ it as local time. `score` is rounded to 4 decimals.
 | Shape | Fields |
 | --- | --- |
 | Memory hit | `source="memory"`, `score`, `file`, `theme`, `title`, `description` |
-| Chat hit | `source="chat"`, `score`, `file` (full transcript path), `line`, `uuid`, `chunk`, `session`, `cwd`, `role`, `ts`, `text` (the stored preview) |
+| Chat hit | `source="chat"` (main transcript) or `"agent"` (subagent transcript), `score`, `file` (full transcript path), `line`, `uuid`, `chunk`, `session`, `cwd`, `role`, `ts`, `text` (the stored preview) |
 | `show` | `role`, `ts`, `line`, `uuid`, `anchor` (bool), `text` (full) |
 | `stats` | `store`, `memories`, `memoryBytes`, `memoryModel`, `chatItems`, `transcripts`, `chatModel`, `includeAgents`, `metaVersion`, `vecBytes`, `metaBytes`, `stateBytes`, `threads`, `batch`, `cores`, `models` |
 
@@ -128,7 +135,9 @@ Downloaded from huggingface.co on first use; `show` never loads a model. gemma's
 external to the graph, so both `.onnx` files must keep their published names and sit together.
 Each model prefixes what it embeds — bge only its query, gemma both (`task: search result |
 query: ` and `title: none | text: `) — and 512/256 token caps are shared, so the chat chunking
-means the same thing under either.
+means the same thing under either. A bge search saves the graph ONNX Runtime optimises as
+`model.optimized.onnx` beside the model and reuses it while `model.optimized.key` (model size,
+mtime, runtime build) still matches; memfind-rs shares both files. gemma is never cached.
 
 ### `--model both`
 

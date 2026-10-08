@@ -7,12 +7,11 @@ var words = new List<string>();
 var chatsOnly = false;
 var memoryOnly = false;
 var rebuild = false;
-var includeAgents = false;
+var includeAgents = true;
 var fp32 = false;
 var gpu = false;
 string? model = null;
 var chats = false;
-var all = false;
 var json = false;
 var context = 3;
 
@@ -45,7 +44,7 @@ for (var i = 0; i < args.Length; i++)
             chatsOnly = true;
             break;
 
-        case "--memory-only":
+        case "--memory-only" or "--memories":
             memoryOnly = true;
             break;
 
@@ -54,7 +53,10 @@ for (var i = 0; i < args.Length; i++)
             break;
 
         case "--include-agents":
-            includeAgents = true;
+            break;
+
+        case "--no-agents":
+            includeAgents = false;
             break;
 
         case "--fp32":
@@ -100,7 +102,6 @@ for (var i = 0; i < args.Length; i++)
             break;
 
         case "--all":
-            all = true;
             break;
 
         default:
@@ -212,21 +213,35 @@ if (words.Count > 0 && words[0] == "show")
     );
 }
 
-var query = string.Join(' ', words);
-
-if (all)
+chatsOnly |= chats;
+if (chatsOnly && memoryOnly)
 {
-    var code = MemFind.Index.Search(store, specs, query, k, json);
+    Console.Error.WriteLine("--chats/--chats-only and --memory-only/--memories exclude each other");
+    return 2;
+}
+
+var query = string.Join(' ', words);
+var embedders = new Dictionary<ModelSpec, Task<Embedder>>();
+
+try
+{
+    if (chatsOnly)
+        return ChatIndex.Search(store, specs, query, k, json, embedders);
+    if (memoryOnly)
+        return MemFind.Index.Search(store, specs, query, k, json, embedders);
+
+    var code = MemFind.Index.Search(store, specs, query, k, json, embedders);
     if (!json)
         Console.WriteLine();
-    return ChatIndex.Search(store, specs, query, k, json) is var chatCode && code != 0
+    return ChatIndex.Search(store, specs, query, k, json, embedders) is var chatCode
+        && code != 0
         ? code
         : chatCode;
 }
-
-return chats
-    ? ChatIndex.Search(store, specs, query, k, json)
-    : MemFind.Index.Search(store, specs, query, k, json);
+finally
+{
+    Embedder.DisposeAll(embedders);
+}
 
 static int Stats(string store, bool json)
 {
@@ -353,10 +368,10 @@ static void Usage()
         memfind — semantic search over the Claude Code memory store and chat transcripts
 
           memfind index [options]              build both indexes (<store>\.memfind\)
-          memfind <query words...> [-k N]      search memories; default k=5
+          memfind <query words...> [-k N]      search memories, chats and agent chats; default k=5
           memfind ... --model bge|gemma|both   which model to index/search with
-          memfind <query words...> --chats     search chat transcripts
-          memfind <query words...> --all       search both
+          memfind <query words...> --chats     search chat transcripts only (main and agent)
+          memfind <query words...> --memories  search memories only
           memfind show <file>:<line> [-c N]    print that transcript message in full
           memfind stats                        what is indexed
           memfind --help                       this screen
@@ -365,7 +380,7 @@ static void Usage()
           --chats-only     skip the memory store
           --memory-only    skip the transcripts
           --rebuild        ignore the incremental state and re-read every transcript
-          --include-agents index subagent transcripts too
+          --no-agents      skip subagent transcripts (indexed by default)
           --fp32           alias for --model bge-fp32
           --gpu            try the CUDA execution provider, fall back to CPU
           --threads N      intra-op and parse threads (default: half the cores)
@@ -376,6 +391,13 @@ static void Usage()
           -c N             messages of context on each side of a shown message (default: 3)
           --json           one JSON object per line instead of columns
           --model <name>   bge (default), bge-fp32, gemma, or both
+          --chats, --chats-only     search chat transcripts only (main and agent)
+          --memories, --memory-only search memories only
+          --all            search everything (the default)
+
+        Every hit names its source right after the score: memory (memory store),
+        chat (a main session transcript) or agent (a subagent transcript); --json
+        carries the same value in "source".
 
         A chat hit prints three lines: the score row, the transcript path with the
         1-based line number of the message, then a 160-char preview. Feed that
@@ -395,6 +417,7 @@ static void Usage()
           memfind how do I switch which clone IIS serves
           memfind "unsigned installer" -k 10
           memfind NUL-filled build output --chats
+          memfind junction scope dir --memories
           memfind show C:\Users\me\.claude\projects\C--Git\a1b2.jsonl:8412 -c 2
         """
     );

@@ -182,10 +182,13 @@ internal static class Index
         string root,
         ModelSpec spec,
         string query,
-        int k
+        int k,
+        Dictionary<ModelSpec, Task<Embedder>> embedders
     )
     {
         var path = PathFor(root, spec);
+        if (File.Exists(path))
+            Embedder.Preload(embedders, spec);
         var index = File.Exists(path)
             ? JsonSerializer.Deserialize(File.ReadAllText(path), Ctx.Default.IndexFile)
             : null;
@@ -200,7 +203,7 @@ internal static class Index
             return null;
         }
 
-        using var embedder = Embedder.Load(ModelSpec.ByName(index.Model) ?? spec);
+        var embedder = Embedder.ForQuery(embedders, ModelSpec.ByName(index.Model) ?? spec);
         var q = embedder.EmbedQuery(query);
 
         return index
@@ -210,12 +213,19 @@ internal static class Index
             .ToList();
     }
 
-    public static int Search(string root, ModelSpec[] specs, string query, int k, bool json)
+    public static int Search(
+        string root,
+        ModelSpec[] specs,
+        string query,
+        int k,
+        bool json,
+        Dictionary<ModelSpec, Task<Embedder>> embedders
+    )
     {
         if (specs.Length > 1)
-            return SearchFused(root, specs, query, k, json);
+            return SearchFused(root, specs, query, k, json, embedders);
 
-        var hits = Rank(root, specs[0], query, k);
+        var hits = Rank(root, specs[0], query, k, embedders);
         if (hits is null)
             return 1;
 
@@ -245,7 +255,7 @@ internal static class Index
         foreach (var (item, score) in hits)
         {
             Console.WriteLine(
-                $"{score:F3}  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}   {item.Title}"
+                $"{score:F3}  memory  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}   {item.Title}"
             );
             Console.WriteLine($"       {Truncate(item.Description, 160)}");
         }
@@ -253,14 +263,21 @@ internal static class Index
         return 0;
     }
 
-    private static int SearchFused(string root, ModelSpec[] specs, string query, int k, bool json)
+    private static int SearchFused(
+        string root,
+        ModelSpec[] specs,
+        string query,
+        int k,
+        bool json,
+        Dictionary<ModelSpec, Task<Embedder>> embedders
+    )
     {
         var fused = new Dictionary<string, (IndexItem Item, float Score, List<Leg> Legs)>();
         var legs = 0;
 
         foreach (var spec in specs)
         {
-            var hits = Rank(root, spec, query, 3 * k);
+            var hits = Rank(root, spec, query, 3 * k, embedders);
             if (hits is null)
                 continue;
             legs++;
@@ -311,7 +328,7 @@ internal static class Index
         foreach (var (item, score, hitLegs) in rows)
         {
             Console.WriteLine(
-                $"{score:F3}  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}   {item.Title}   [{Describe(hitLegs)}]"
+                $"{score:F3}  memory  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}   {item.Title}   [{Describe(hitLegs)}]"
             );
             Console.WriteLine($"       {Truncate(item.Description, 160)}");
         }

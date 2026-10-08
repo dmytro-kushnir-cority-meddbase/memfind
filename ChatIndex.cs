@@ -494,7 +494,13 @@ internal static class ChatIndex
         }
     }
 
-    private static unsafe List<Row>? Rows(string root, ModelSpec spec, string query, int k)
+    private static unsafe List<Row>? Rows(
+        string root,
+        ModelSpec spec,
+        string query,
+        int k,
+        Dictionary<ModelSpec, Task<Embedder>> embedders
+    )
     {
         var vec = VecPath(root, spec);
         if (!File.Exists(vec) || new FileInfo(vec).Length == 0)
@@ -507,6 +513,7 @@ internal static class ChatIndex
             return null;
         }
 
+        Embedder.Preload(embedders, spec);
         var state = LoadState(root, spec);
         if (state.MetaVersion != MetaVersion)
         {
@@ -518,7 +525,7 @@ internal static class ChatIndex
         var vectorBytes = loaded.Dim * sizeof(float);
         var count = (int)(new FileInfo(vec).Length / vectorBytes);
 
-        using var embedder = Embedder.Load(loaded);
+        var embedder = Embedder.ForQuery(embedders, loaded);
         var q = embedder.EmbedQuery(query);
 
         var heap = new TopK(k);
@@ -574,6 +581,10 @@ internal static class ChatIndex
 
             rows.Add(
                 new Row(
+                    file.Split('\\', '/')
+                        .Any(s => s.Equals("subagents", StringComparison.OrdinalIgnoreCase))
+                        ? "agent"
+                        : "chat",
                     score,
                     System.IO.Path.Combine(Chats.ProjectsRoot, file),
                     GetNumber(element, "line"),
@@ -594,12 +605,19 @@ internal static class ChatIndex
         return rows;
     }
 
-    public static int Search(string root, ModelSpec[] specs, string query, int k, bool json)
+    public static int Search(
+        string root,
+        ModelSpec[] specs,
+        string query,
+        int k,
+        bool json,
+        Dictionary<ModelSpec, Task<Embedder>> embedders
+    )
     {
         if (specs.Length > 1)
-            return SearchFused(root, specs, query, k, json);
+            return SearchFused(root, specs, query, k, json, embedders);
 
-        var rows = Rows(root, specs[0], query, k);
+        var rows = Rows(root, specs[0], query, k, embedders);
         if (rows is null)
             return 1;
 
@@ -610,7 +628,7 @@ internal static class ChatIndex
             {
                 var writer = output.Writer;
                 writer.WriteStartObject();
-                writer.WriteString("source"u8, "chat");
+                writer.WriteString("source"u8, row.Source);
                 writer.WriteNumber("score"u8, Math.Round(row.Score, 4));
                 writer.WriteString("file"u8, row.Path);
                 writer.WriteNumber("line"u8, row.Line);
@@ -632,7 +650,14 @@ internal static class ChatIndex
         return 0;
     }
 
-    private static int SearchFused(string root, ModelSpec[] specs, string query, int k, bool json)
+    private static int SearchFused(
+        string root,
+        ModelSpec[] specs,
+        string query,
+        int k,
+        bool json,
+        Dictionary<ModelSpec, Task<Embedder>> embedders
+    )
     {
         var fused = new Dictionary<
             (string Path, long Line, int Chunk),
@@ -642,7 +667,7 @@ internal static class ChatIndex
 
         foreach (var spec in specs)
         {
-            var rows = Rows(root, spec, query, 3 * k);
+            var rows = Rows(root, spec, query, 3 * k, embedders);
             if (rows is null)
                 continue;
             legs++;
@@ -675,7 +700,7 @@ internal static class ChatIndex
             {
                 var writer = output.Writer;
                 writer.WriteStartObject();
-                writer.WriteString("source"u8, "chat");
+                writer.WriteString("source"u8, row.Source);
                 writer.WriteNumber("score"u8, Math.Round(score, 4));
                 writer.WriteString("file"u8, row.Path);
                 writer.WriteNumber("line"u8, row.Line);
@@ -706,7 +731,7 @@ internal static class ChatIndex
         foreach (var (row, score, legs) in hits)
         {
             Console.WriteLine(
-                $"{score:F3}  {row.Time}  {row.Role.PadRight(roleWidth)}   {row.Slug.PadRight(slugWidth)}   {row.ShortSession}"
+                $"{score:F3}  {row.Source,-6}  {row.Time}  {row.Role.PadRight(roleWidth)}   {row.Slug.PadRight(slugWidth)}   {row.ShortSession}"
                     + (legs is null ? "" : $"   [{Index.Describe(legs)}]")
             );
             Console.WriteLine($"       {row.Path}:{row.Line}");
@@ -715,6 +740,7 @@ internal static class ChatIndex
     }
 
     private readonly record struct Row(
+        string Source,
         float Score,
         string Path,
         long Line,
