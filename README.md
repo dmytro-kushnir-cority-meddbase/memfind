@@ -232,7 +232,7 @@ GPU. Queries are ~40 ms, so search has no `--gpu`.
 and their file/line anchors, capped at 3000 characters total. It skips prompts
 shorter than 12 characters, scores below 0.72, duplicate texts, repeated files,
 and the current session/transcript. Excerpts are labelled as historical,
-untrusted reference data. The search has a one-second timeout and errors leave
+untrusted reference data. The search has a ten-second timeout and errors leave
 the prompt unchanged. It never runs indexing, and skips retrieval if the BGE
 model files are absent so that submitting a prompt cannot download a model.
 
@@ -247,7 +247,7 @@ Use absolute paths to your Python 3 interpreter and installed script:
       "hooks": [{
         "type": "command",
         "command": "python3 /absolute/path/to/.codex/hooks/memfind_context.py",
-        "timeout": 2,
+        "timeout": 12,
         "additionalContextLimit": 3000
       }]
     }]

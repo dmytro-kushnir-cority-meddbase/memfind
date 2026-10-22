@@ -83,7 +83,7 @@ class HookTests(unittest.TestCase):
         args, kwargs = self.run.call_args
         self.assertEqual(args[0], ["/fake/memfind", self.event["prompt"][:2000], "--model", "bge", "--threads", "2", "--json", "-k", "8"])
         self.assertFalse(kwargs.get("shell", False))
-        self.assertEqual(kwargs["timeout"], 1.0)
+        self.assertEqual(kwargs["timeout"], 10.0)
         self.assertFalse(kwargs["check"])
 
     def test_timeout_fails_open(self):

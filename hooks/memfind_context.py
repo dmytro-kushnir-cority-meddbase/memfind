@@ -12,7 +12,7 @@ import sys
 MAX_CONTEXT = 3000
 MAX_HITS = 4
 MIN_SCORE = 0.72
-TIMEOUT = 1.0
+TIMEOUT = 10.0
 
 
 def data_root():
