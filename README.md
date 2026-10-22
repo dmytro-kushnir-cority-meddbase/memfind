@@ -225,7 +225,46 @@ Measured here (RTX 5060, cuDNN 9.26, 256-token chunks, batch 64): gemma int8 13.
 vs 182.5 on CUDA; bge int8 73.8 on CPU. The gemma memory index takes 29.9 s on CPU and 4.7 s on
 GPU. Queries are ~40 ms, so search has no `--gpu`.
 
-## SessionStart hook
+## Codex prompt context hook
+
+`hooks/memfind_context.py` searches existing BGE memory and chat indexes on
+`UserPromptSubmit`. It emits Codex `additionalContext` with up to four excerpts
+and their file/line anchors, capped at 3000 characters total. It skips prompts
+shorter than 12 characters, scores below 0.72, duplicate texts, repeated files,
+and the current session/transcript. Excerpts are labelled as historical,
+untrusted reference data. The search has a one-second timeout and errors leave
+the prompt unchanged. It never runs indexing, and skips retrieval if the BGE
+model files are absent so that submitting a prompt cannot download a model.
+
+Copy the script to your Codex home (`$CODEX_HOME` or `~/.codex`) under
+`hooks/memfind_context.py`, then merge this entry into that home's `hooks.json`.
+Use absolute paths to your Python 3 interpreter and installed script:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python3 /absolute/path/to/.codex/hooks/memfind_context.py",
+        "timeout": 2,
+        "additionalContextLimit": 3000
+      }]
+    }]
+  }
+}
+```
+
+On Windows use `commandWindows` with your Python/script paths quoted as needed.
+`memfind` must be on the hook's PATH (macOS also checks `/usr/local/bin/memfind`).
+Review and trust the hook in Codex `/hooks` or the app's Hooks settings, then
+start a new chat. Codex skips untrusted hook definitions. Local command hooks
+require local orchestration; see the [official hooks documentation](https://learn.chatgpt.com/docs/hooks).
+Update indexes separately with `memfind index --model bge`.
+
+Hook checks: `python3 tests/hook.py -v` (isolated behavior tests).
+
+## Claude SessionStart hook
 
 `~/.claude/settings.json` runs the index on every session start, async so it never blocks:
 
