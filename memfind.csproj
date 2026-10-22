@@ -17,6 +17,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="$(OnnxRuntimeVersion)" Condition="!$([MSBuild]::IsOSPlatform('OSX'))" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="$(OnnxRuntimeVersion)" Condition="$([MSBuild]::IsOSPlatform('OSX'))" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />

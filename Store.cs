@@ -9,7 +9,8 @@ internal sealed record MemoryDoc(
     string Description,
     string Hook,
     string Type,
-    int Line = 0
+    int Line = 0,
+    DateTimeOffset? Timestamp = null
 )
 {
     public string Text
@@ -63,7 +64,8 @@ internal static class Store
             if (string.IsNullOrWhiteSpace(title))
                 title = Path.GetFileNameWithoutExtension(fileName);
 
-            docs.Add(new MemoryDoc(fileName, theme, title, description, hook, type));
+            docs.Add(new MemoryDoc(fileName, theme, title, description, hook, type,
+                Timestamp: File.GetLastWriteTimeUtc(path)));
         }
 
         docs.AddRange(ParseCodex(Paths.CodexMemories));
@@ -95,6 +97,7 @@ internal static class Store
         }
         foreach (var file in files.Distinct(Paths.Comparer).OrderBy(p => p, Paths.Comparer))
         {
+            var timestamp = new DateTimeOffset(File.GetLastWriteTimeUtc(file));
             var lines = ReadLines(file);
             var title = Path.GetFileNameWithoutExtension(file);
             for (var start = 0; start < lines.Count;)
@@ -122,7 +125,7 @@ internal static class Store
                 {
                     var position = text.IndexOf(chunk, offset, StringComparison.Ordinal);
                     var line = start + 1 + text.AsSpan(0, position).Count('\n');
-                    yield return new MemoryDoc(Path.GetFullPath(file), "codex", title, chunk, "", "codex", line);
+                    yield return new MemoryDoc(Path.GetFullPath(file), "codex", title, chunk, "", "codex", line, timestamp);
                     offset = position + chunk.Length;
                 }
                 start = end;

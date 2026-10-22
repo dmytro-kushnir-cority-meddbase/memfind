@@ -65,6 +65,7 @@ Source transcripts and memories are read only; indexes are written only under th
 | `memfind <query words...> --memories` | Search memories only |
 | `memfind show <file>:<line> [-c N]` | Print that transcript message in full, with neighbours |
 | `memfind stats` | What is indexed |
+| `memfind context-hook` | Native Codex UserPromptSubmit handler, JSON on stdin/stdout |
 | `memfind --help` | Usage |
 
 Every command takes `--model bge|bge-fp32|gemma|both`; `bge` is the default. On `index`, `both`
@@ -91,6 +92,7 @@ builds each model in turn; on a query it searches with each and fuses the two ra
 | `--fp32` | `index` | Alias for `--model bge-fp32`; with `--model both` it is an error (exit 2) |
 | `--gpu` | `index` | Try the CUDA execution provider, fall back to CPU |
 | `--threads N` | all | Intra-op and parse threads (default: half the cores; a search uses 4 intra-op) |
+| `--offline` | all | Fail instead of downloading missing model files |
 
 ## Exit codes
 
@@ -139,12 +141,15 @@ header starts with `>>>` instead of `---`:
 
 ## Output — `--json`
 
-One object per line (JSONL). `ts` is the raw transcript timestamp (ISO-8601 UTC); text mode renders
-it as local time. `score` is rounded to 4 decimals.
+One object per line (JSONL). Chat `ts` is the original transcript message timestamp;
+memory `ts` is the source file's last-write time in UTC (absent in older indexes).
+Text mode renders chat time locally. `score` is rounded to 4 decimals by default;
+`--full-precision` preserves the original scores in JSON, as used by the hook
+to apply its similarity threshold before rounding.
 
 | Shape | Fields |
 | --- | --- |
-| Memory hit | `source="memory"`, `score`, `file`, `theme`, `title`, `description`, `line` (Codex memory passage anchor; 0 for ordinary store documents) |
+| Memory hit | `source="memory"`, `score`, `file`, `theme`, `title`, `description`, `ts`, `line` (Codex memory passage anchor; 0 for ordinary store documents) |
 | Chat hit | `source="chat"`/`"agent"` (Claude) or `"codex"`/`"codex-agent"` (Codex), `score`, `file` (full transcript path), `line`, `uuid`, `chunk`, `session`, `cwd`, `role`, `ts`, `text` (the stored preview) |
 | `show` | `role`, `ts`, `line`, `uuid`, `anchor` (bool), `text` (full) |
 | `stats` | `store`, `memories`, `memoryBytes`, `memoryModel`, `chatItems`, `transcripts`, `chatModel`, `includeAgents`, `metaVersion`, `vecBytes`, `metaBytes`, `stateBytes`, `threads`, `batch`, `cores`, `models` |
@@ -227,18 +232,36 @@ GPU. Queries are ~40 ms, so search has no `--gpu`.
 
 ## Codex prompt context hook
 
-`hooks/memfind_context.py` searches existing BGE memory and chat indexes on
+`memfind context-hook` searches existing Gemma memory and chat indexes on
 `UserPromptSubmit`. It emits Codex `additionalContext` with up to four excerpts
 and their file/line anchors, capped at 3000 characters total. It skips prompts
-shorter than 12 characters, scores below 0.72, duplicate texts, repeated files,
+shorter than 12 characters, scores below 0.38, duplicate texts, repeated files,
 and the current session/transcript. Excerpts are labelled as historical,
-untrusted reference data. The search has a ten-second timeout and errors leave
-the prompt unchanged. It never runs indexing, and skips retrieval if the BGE
-model files are absent so that submitting a prompt cannot download a model.
+untrusted reference data. Errors leave the prompt unchanged. The Codex command
+has a **ten-second timeout**; the native handler gives its search worker 9.5
+seconds including event input and preflight, then kills it and returns no context.
+It needs no Python interpreter, runs the worker with `--offline`, never indexes, and skips retrieval
+if any Gemma model file is missing/empty or neither Gemma index exists, so that
+submitting a prompt cannot download a model. The 0.38 floor is an initial local
+probe setting, not a calibrated confidence probability. Only already-built
+indexes are searched; build the chat index separately to include transcripts.
 
-Copy the script to your Codex home (`$CODEX_HOME` or `~/.codex`) under
-`hooks/memfind_context.py`, then merge this entry into that home's `hooks.json`.
-Use absolute paths to your Python 3 interpreter and installed script:
+The hook retrieves up to 64 candidates per source, applies the raw similarity
+floor, then sorts by `score * (1 + 0.10 * 2^(-age_days / 7))`. A fresh source
+gets at most a 10% bonus, halving each week. Future dates are clamped to age zero;
+missing or invalid dates get no bonus. This reranks the candidate subset, not
+the whole corpus. Each excerpt header includes raw `score`, `rank_score` and
+valid source `ts`. Ordinary CLI search keeps its existing similarity ordering.
+
+Chat fragments use the original message timestamp; tool calls/results are
+excluded. Memory fragments share the file's last-write time, so editing a file
+refreshes all its passages. Run `memfind index --model gemma --memory-only` to
+update dates in older indexes: unchanged text reuses its embeddings. A date-only
+change rewrites metadata without recomputing vectors.
+
+Publish and install the native executable, then merge this entry into your
+Codex home's `hooks.json` (`$CODEX_HOME` or `~/.codex`). Use an absolute executable
+path; [hooks/hooks.example.json](hooks/hooks.example.json) is the same example:
 
 ```json
 {
@@ -246,8 +269,8 @@ Use absolute paths to your Python 3 interpreter and installed script:
     "UserPromptSubmit": [{
       "hooks": [{
         "type": "command",
-        "command": "python3 /absolute/path/to/.codex/hooks/memfind_context.py",
-        "timeout": 12,
+        "command": "/usr/local/bin/memfind context-hook",
+        "timeout": 10,
         "additionalContextLimit": 3000
       }]
     }]
@@ -255,14 +278,15 @@ Use absolute paths to your Python 3 interpreter and installed script:
 }
 ```
 
-On Windows use `commandWindows` with your Python/script paths quoted as needed.
-`memfind` must be on the hook's PATH (macOS also checks `/usr/local/bin/memfind`).
+On Windows use `commandWindows` with the native executable path quoted as needed.
 Review and trust the hook in Codex `/hooks` or the app's Hooks settings, then
 start a new chat. Codex skips untrusted hook definitions. Local command hooks
 require local orchestration; see the [official hooks documentation](https://learn.chatgpt.com/docs/hooks).
-Update indexes separately with `memfind index --model bge`.
+Prepare indexes separately with `memfind index --model gemma` (or start with
+`memfind index --model gemma --memory-only` for curated memory).
 
-Hook checks: `python3 tests/hook.py -v` (isolated behavior tests).
+Hook checks: `dotnet run -c Release --project tests/HookContracts/HookContracts.csproj`
+(native contract checks and a real timed-out worker; no Python).
 
 ## Claude SessionStart hook
 
@@ -273,8 +297,11 @@ Hook checks: `python3 tests/hook.py -v` (isolated behavior tests).
   "args": ["index"], "async": true, "timeout": 300 }
 ```
 
-## The mutex
+## Index writer lock
 
-`index` takes `Global\memfind-index` on Windows and `memfind-index` on Unix without waiting. A second one — parallel sessions starting
-together — prints `memfind: another index is running, skipping` and exits 0, so concurrent hooks
-never race on `chats.vec`.
+`index` exclusively opens `.memfind/index.lock` without waiting. A second
+indexer for the same store prints `memfind: another index is running, skipping`
+and exits 0. Filesystem aliases share the same lock, while independent stores
+can index concurrently, including a staging store for a long first build.
+The lock file stays in place after release. Older binaries used a global named
+mutex; stop any old indexer before indexing the same store with this version.

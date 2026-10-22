@@ -14,6 +14,9 @@ internal sealed class IndexItem
     [JsonPropertyName("line")]
     public int Line { get; set; }
 
+    [JsonPropertyName("ts")]
+    public DateTimeOffset? Timestamp { get; set; }
+
     [JsonPropertyName("theme")]
     public string Theme { get; set; } = "";
 
@@ -78,6 +81,7 @@ internal static class Index
             {
                 File = doc.File,
                 Line = doc.Line,
+                Timestamp = doc.Timestamp,
                 Theme = doc.Theme,
                 Title = doc.Title,
                 Description = doc.Description,
@@ -187,6 +191,7 @@ internal static class Index
             if (
                 x.File != y.File
                 || x.Line != y.Line
+                || x.Timestamp != y.Timestamp
                 || x.Theme != y.Theme
                 || x.Title != y.Title
                 || x.Description != y.Description
@@ -259,9 +264,11 @@ internal static class Index
                 var writer = output.Writer;
                 writer.WriteStartObject();
                 writer.WriteString("source"u8, "memory");
-                writer.WriteNumber("score"u8, Math.Round(score, 4));
+                writer.WriteNumber("score"u8, JsonLines.Score(score));
                 writer.WriteString("file"u8, item.File);
                 writer.WriteNumber("line"u8, item.Line);
+                if (item.Timestamp is { } ts)
+                    writer.WriteString("ts"u8, ts);
                 writer.WriteString("theme"u8, item.Theme);
                 writer.WriteString("title"u8, item.Title);
                 writer.WriteString("description"u8, item.Description);
@@ -333,9 +340,11 @@ internal static class Index
                 var writer = output.Writer;
                 writer.WriteStartObject();
                 writer.WriteString("source"u8, "memory");
-                writer.WriteNumber("score"u8, Math.Round(score, 4));
+                writer.WriteNumber("score"u8, JsonLines.Score(score));
                 writer.WriteString("file"u8, item.File);
                 writer.WriteNumber("line"u8, item.Line);
+                if (item.Timestamp is { } ts)
+                    writer.WriteString("ts"u8, ts);
                 writer.WriteString("theme"u8, item.Theme);
                 writer.WriteString("title"u8, item.Title);
                 writer.WriteString("description"u8, item.Description);
@@ -373,7 +382,7 @@ internal static class Index
         {
             writer.WriteStartObject();
             writer.WriteString("model"u8, leg.Model);
-            writer.WriteNumber("score"u8, Math.Round(leg.Score, 4));
+            writer.WriteNumber("score"u8, JsonLines.Score(leg.Score));
             writer.WriteNumber("rank"u8, leg.Rank);
             writer.WriteEndObject();
         }
