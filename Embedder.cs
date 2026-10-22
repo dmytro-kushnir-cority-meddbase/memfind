@@ -260,7 +260,9 @@ internal sealed class Embedder : IDisposable
 
         var threads = query ? _queryThreads : Threads;
 
-        var options = new SessionOptions();
+        // Keep the options alive throughout native initialization, including background loads.
+        // NativeAOT can otherwise collect them while another model's index is being decoded.
+        using var options = new SessionOptions();
         options.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
         options.IntraOpNumThreads = threads;
         options.InterOpNumThreads = 1;
@@ -356,6 +358,12 @@ internal sealed class Embedder : IDisposable
     /// </summary>
     private static bool TryEnableCuda(SessionOptions options)
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.Error.WriteLine("cuda auto-detection is only supported on Windows, using cpu");
+            return false;
+        }
+
         var cudnn = FindDirectory(
             Environment.GetEnvironmentVariable("MEMFIND_CUDNN"),
             "cudnn64_9.dll",
@@ -523,7 +531,8 @@ internal sealed class Embedder : IDisposable
     public void EmbedMany(
         IReadOnlyList<int[]> tokens,
         float[] destination,
-        Action<int>? progress = null
+        Action<int, long>? progress = null,
+        IReadOnlyList<int>? characters = null
     )
     {
         var order = new int[tokens.Count];
@@ -534,6 +543,7 @@ internal sealed class Embedder : IDisposable
         var batch = new int[BatchSize][];
         var pooled = new float[BatchSize * Dim];
         var done = 0;
+        long chars = 0;
 
         for (var from = 0; from < order.Length; from += BatchSize)
         {
@@ -547,7 +557,14 @@ internal sealed class Embedder : IDisposable
                 Array.Copy(pooled, (long)i * Dim, destination, (long)order[from + i] * Dim, Dim);
 
             done += count;
-            progress?.Invoke(done);
+            if (characters is not null)
+            {
+                for (var i = 0; i < count; i++)
+                {
+                    chars += characters[order[from + i]];
+                }
+            }
+            progress?.Invoke(done, chars);
         }
     }
 

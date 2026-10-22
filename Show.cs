@@ -92,15 +92,9 @@ internal static class Show
         ref bool bad
     )
     {
-        using var stream = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.ReadWrite,
-            1 << 20,
-            FileOptions.SequentialScan
-        );
+        using var stream = Transcript.Open(path);
 
+        var transcript = Transcript.Inspect(path);
         var buffer = new byte[Chats.ReadChunk];
         var filled = 0;
         long number = 0;
@@ -155,7 +149,7 @@ internal static class Show
                     line = line[..^1];
 
                 var message = Chats.Message.Empty;
-                var keep = line.Length > 0 && Chats.TryReadKept(line, includeAgents, out message);
+                var keep = line.Length > 0 && transcript.TryRead(line, number, includeAgents, out message);
                 if (number == anchor && !keep)
                 {
                     bad = true;

@@ -8,7 +8,8 @@ internal sealed record MemoryDoc(
     string Title,
     string Description,
     string Hook,
-    string Type
+    string Type,
+    int Line = 0
 )
 {
     public string Text
@@ -29,7 +30,7 @@ internal sealed record MemoryDoc(
 
 internal static class Store
 {
-    public const string DefaultRoot = @"C:\Git\docs\memory";
+    public static string DefaultRoot => Paths.Store;
 
     public static List<MemoryDoc> Parse(string root)
     {
@@ -65,7 +66,68 @@ internal static class Store
             docs.Add(new MemoryDoc(fileName, theme, title, description, hook, type));
         }
 
+        docs.AddRange(ParseCodex(Paths.CodexMemories));
         return docs;
+    }
+
+    private static IEnumerable<MemoryDoc> ParseCodex(string root)
+    {
+        if (!Directory.Exists(root))
+        {
+            yield break;
+        }
+        var files = new List<string>();
+        foreach (var name in new[] { "MEMORY.md", "memory_summary.md" })
+        {
+            var path = Path.Combine(root, name);
+            if (File.Exists(path))
+            {
+                files.Add(path);
+            }
+        }
+        foreach (var directory in new[] { "rollout_summaries", Path.Combine("extensions", "ad_hoc", "notes") })
+        {
+            var path = Path.Combine(root, directory);
+            if (Directory.Exists(path))
+            {
+                files.AddRange(Directory.GetFiles(path, "*.md", SearchOption.AllDirectories));
+            }
+        }
+        foreach (var file in files.Distinct(Paths.Comparer).OrderBy(p => p, Paths.Comparer))
+        {
+            var lines = ReadLines(file);
+            var title = Path.GetFileNameWithoutExtension(file);
+            for (var start = 0; start < lines.Count;)
+            {
+                if (string.IsNullOrWhiteSpace(lines[start]))
+                {
+                    start++;
+                    continue;
+                }
+                if (lines[start].StartsWith('#'))
+                {
+                    title = lines[start].TrimStart('#', ' ');
+                }
+                var end = start + 1;
+                var length = lines[start].Length;
+                while (end < lines.Count && length + lines[end].Length < 1200 && !lines[end].StartsWith('#'))
+                {
+                    length += lines[end].Length + 1;
+                    end++;
+                }
+                var text = string.Join('\n', lines.GetRange(start, end - start)).Trim();
+                // A long single line can still exceed the model window.
+                var offset = 0;
+                foreach (var chunk in Chats.Chunk(text, 1))
+                {
+                    var position = text.IndexOf(chunk, offset, StringComparison.Ordinal);
+                    var line = start + 1 + text.AsSpan(0, position).Count('\n');
+                    yield return new MemoryDoc(Path.GetFullPath(file), "codex", title, chunk, "", "codex", line);
+                    offset = position + chunk.Length;
+                }
+                start = end;
+            }
+        }
     }
 
     private sealed record Placement(string Theme, string Title, string Hook);
