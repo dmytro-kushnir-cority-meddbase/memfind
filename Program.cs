@@ -1,3 +1,4 @@
+using System.Globalization;
 using MemFind;
 
 var store = Store.DefaultRoot;
@@ -8,12 +9,15 @@ var chatsOnly = false;
 var memoryOnly = false;
 var rebuild = false;
 var includeAgents = true;
+var sources = TranscriptSources.All;
 var fp32 = false;
 var gpu = false;
 string? model = null;
 var chats = false;
 var json = false;
 var context = 3;
+var recency = new RecencyOptions();
+var budgetMs = 7000;
 
 for (var i = 0; i < args.Length; i++)
 {
@@ -81,6 +85,27 @@ for (var i = 0; i < args.Length; i++)
             includeAgents = false;
             break;
 
+        case "--sources":
+            sources = 0;
+            foreach (var source in i + 1 < args.Length ? args[++i].Split(',') : Array.Empty<string>())
+            {
+                if (source.Trim().Equals("claude", StringComparison.OrdinalIgnoreCase))
+                    sources |= TranscriptSources.Claude;
+                else if (source.Trim().Equals("codex", StringComparison.OrdinalIgnoreCase))
+                    sources |= TranscriptSources.Codex;
+                else
+                {
+                    Console.Error.WriteLine($"--sources needs a comma-separated list of claude, codex (got '{source}')");
+                    return 2;
+                }
+            }
+            if (sources == 0)
+            {
+                Console.Error.WriteLine("--sources needs a comma-separated list of claude, codex");
+                return 2;
+            }
+            break;
+
         case "--fp32":
             fp32 = true;
             break;
@@ -93,10 +118,6 @@ for (var i = 0; i < args.Length; i++)
             Embedder.AllowDownloads = false;
             break;
 
-        case "--full-precision":
-            JsonLines.FullPrecision = true;
-            break;
-
         case "--model":
             if (i + 1 >= args.Length)
             {
@@ -104,6 +125,36 @@ for (var i = 0; i < args.Length; i++)
                 return 2;
             }
             model = args[++i];
+            break;
+
+        case "--recency-boost":
+            if (i + 1 >= args.Length
+                || !double.TryParse(args[++i], NumberStyles.Float, CultureInfo.InvariantCulture, out var boost)
+                || !double.IsFinite(boost) || boost < 0)
+            {
+                Console.Error.WriteLine("--recency-boost needs a non-negative number");
+                return 2;
+            }
+            recency = recency with { Boost = boost };
+            break;
+
+        case "--recency-half-life":
+            if (i + 1 >= args.Length
+                || !double.TryParse(args[++i], NumberStyles.Float, CultureInfo.InvariantCulture, out var halfLife)
+                || !double.IsFinite(halfLife) || halfLife <= 0)
+            {
+                Console.Error.WriteLine("--recency-half-life needs a positive number of days");
+                return 2;
+            }
+            recency = recency with { HalfLifeDays = halfLife };
+            break;
+
+        case "--budget-ms":
+            if (i + 1 >= args.Length || !int.TryParse(args[++i], out budgetMs) || budgetMs < 1)
+            {
+                Console.Error.WriteLine("--budget-ms needs a positive integer");
+                return 2;
+            }
             break;
 
         case "--threads":
@@ -175,9 +226,13 @@ if (words.Count == 0)
     return 0;
 }
 
+using var stdout = new BufferedStream(Console.OpenStandardOutput());
+
 if (words.Count == 1 && words[0] == "context-hook")
 {
-    return await ContextHook.RunAsync(store);
+    // The hook's own default is three hits per source, not the CLI's five.
+    return ContextHook.Run(store, model is null ? ModelSpec.Indexes : specs, recency,
+        args.Contains("-k") ? k : 3, budgetMs, stdout);
 }
 
 if (words.Count == 1 && words[0] == "index")
@@ -194,9 +249,9 @@ if (words.Count == 1 && words[0] == "index")
     foreach (var spec in specs)
     {
         if (!chatsOnly)
-            code = MemFind.Index.Build(store, spec, gpu);
+            code = MemFind.Index.Build(store, spec, gpu, sources);
         if (code == 0 && !memoryOnly)
-            code = ChatIndex.Build(store, rebuild, includeAgents, spec, gpu);
+            code = ChatIndex.Build(store, rebuild, includeAgents, sources, spec, gpu);
         if (code != 0)
             break;
     }
@@ -204,7 +259,7 @@ if (words.Count == 1 && words[0] == "index")
 }
 
 if (words.Count == 1 && words[0] == "stats")
-    return Stats(store, json);
+    return Stats(store, json, stdout);
 
 if (words.Count > 0 && words[0] == "show")
 {
@@ -228,7 +283,8 @@ if (words.Count > 0 && words[0] == "show")
         showLine,
         context,
         json,
-        includeAgents || ChatIndex.LoadState(store, specs[0]).IncludeAgents
+        includeAgents || ChatIndex.LoadState(store, specs[0]).IncludeAgents,
+        stdout
     );
 }
 
@@ -245,14 +301,14 @@ var embedders = new Dictionary<ModelSpec, Task<Embedder>>();
 try
 {
     if (chatsOnly)
-        return ChatIndex.Search(store, specs, query, k, json, embedders);
+        return ChatIndex.Search(store, specs, query, k, json, embedders, stdout);
     if (memoryOnly)
-        return MemFind.Index.Search(store, specs, query, k, json, embedders);
+        return MemFind.Index.Search(store, specs, query, k, json, embedders, stdout);
 
-    var code = MemFind.Index.Search(store, specs, query, k, json, embedders);
+    var code = MemFind.Index.Search(store, specs, query, k, json, embedders, stdout);
     if (!json)
         Console.WriteLine();
-    var chatCode = ChatIndex.Search(store, specs, query, k, json, embedders);
+    var chatCode = ChatIndex.Search(store, specs, query, k, json, embedders, stdout);
     return code == 0 || chatCode == 0 ? 0 : 1;
 }
 finally
@@ -260,15 +316,14 @@ finally
     Embedder.DisposeAll(embedders);
 }
 
-static int Stats(string store, bool json)
+static int Stats(string store, bool json, Stream stdout)
 {
     var counts = ModelSpec.Indexes.Select(spec => Count(store, spec)).ToList();
     var main = counts[0];
 
     if (json)
     {
-        using var output = new JsonLines();
-        var writer = output.Writer;
+        using var writer = new System.Text.Json.Utf8JsonWriter(stdout);
         writer.WriteStartObject();
         writer.WriteString("store"u8, store);
         writer.WriteNumber("memories"u8, main.Memories);
@@ -303,7 +358,8 @@ static int Stats(string store, bool json)
         }
         writer.WriteEndArray();
         writer.WriteEndObject();
-        output.Flush();
+        writer.Flush();
+        stdout.WriteByte((byte)'\n');
         return 0;
     }
 
@@ -391,7 +447,8 @@ static void Usage()
           memfind <query words...> --memories  search memories only
           memfind show <file>:<line> [-c N]    print that transcript message in full
           memfind stats                        what is indexed
-          memfind context-hook                 native Codex prompt hook (stdin/stdout JSON)
+          memfind context-hook [options]       Claude Code / Codex prompt hook (stdin/stdout JSON);
+                                               --model defaults to both, -k to 3 per source
           memfind --help                       this screen
 
         Index options:
@@ -399,6 +456,9 @@ static void Usage()
           --memory-only    skip the transcripts
           --rebuild        ignore the incremental state and re-read every transcript
           --no-agents      skip subagent transcripts (indexed by default)
+          --sources <list> claude, codex or claude,codex (default: both); codex covers its
+                           rollouts and memories. Codex can import Claude chats, so
+                           `index --sources claude` avoids indexing them twice
           --fp32           alias for --model bge-fp32
           --gpu            try the CUDA execution provider, fall back to CPU
           --threads N      intra-op and parse threads (default: half the cores)
@@ -411,8 +471,13 @@ static void Usage()
           -k N             number of hits to print per source (default: 5)
           -c N             messages of context on each side of a shown message (default: 3)
           --json           one JSON object per line instead of columns
-          --full-precision preserve unrounded scores in JSON (used by context-hook)
           --offline        fail instead of downloading missing model files
+          --budget-ms N    context-hook only: give up silently N ms after process start
+                           (default: 7000)
+          --recency-boost <score>   context-hook only: additive RRF bonus for chats
+                           (default: 0.001; 0 disables; memories never decay)
+          --recency-half-life <days>   context-hook only: age at half the power-law bonus
+                           (default: 21, > 0); bonus = boost / sqrt(1 + 3 * age / days)
           --model <name>   bge (default), bge-fp32, gemma, or both
           --chats, --chats-only     search chat transcripts only (main and agent)
           --memories, --memory-only search memories only
@@ -432,7 +497,7 @@ static void Usage()
         (768-dim, int8), cached in local app data/memfind/, downloaded from
         huggingface.co on first use. Each keeps its own index files; gemma's carry a
         .gemma suffix. --model both searches each and fuses the two rankings (RRF),
-        printing the fused score. Indexing reads both Claude and Codex session roots.
+        printing the fused score. Indexing reads both Claude and Codex session roots unless --sources narrows it.
 
         Examples:
           memfind index

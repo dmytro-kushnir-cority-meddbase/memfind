@@ -39,7 +39,8 @@ internal sealed record ModelSpec(
     int SepId,
     string OutputName,
     string ModelFile,
-    (string Url, string File)[] Files
+    (string Url, string File)[] Files,
+    double Floor
 )
 {
     public static readonly ModelSpec Bge = new(
@@ -66,23 +67,9 @@ internal sealed record ModelSpec(
                 "model.onnx"
             ),
             ("https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/vocab.txt", "vocab.txt"),
-        ]
-    );
-
-    public static readonly ModelSpec BgeFp32 = Bge with
-    {
-        Key = "bge-fp32",
-        Name = "bge-small-en-v1.5",
-        TokenizerSibling = "bge-small-en-v1.5-int8",
-        Files =
-        [
-            (
-                "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx",
-                "model.onnx"
-            ),
-            ("https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/vocab.txt", "vocab.txt"),
         ],
-    };
+        Floor: 0.70
+    );
 
     public static readonly ModelSpec Gemma = new(
         Key: "gemma",
@@ -117,13 +104,14 @@ internal sealed record ModelSpec(
                 "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/main/tokenizer.model",
                 "tokenizer.model"
             ),
-        ]
+        ],
+        Floor: 0.38
     );
 
     public static readonly ModelSpec Default = Bge;
 
     /// <summary>Every model, in CLI order.</summary>
-    public static readonly ModelSpec[] All = [Bge, BgeFp32, Gemma];
+    public static readonly ModelSpec[] All = [Bge, Gemma];
 
     /// <summary>One per distinct set of index files on disk; bge and bge-fp32 share theirs.</summary>
     public static readonly ModelSpec[] Indexes = [Bge, Gemma];

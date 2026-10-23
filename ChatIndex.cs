@@ -43,6 +43,9 @@ internal sealed class ChatState
     [JsonPropertyName("includeAgents")]
     public bool IncludeAgents { get; set; }
 
+    [JsonPropertyName("sources")]
+    public TranscriptSources Sources { get; set; } = TranscriptSources.All;
+
     [JsonPropertyName("files")]
     public List<ChatFileState> Files { get; set; } = [];
 }
@@ -72,9 +75,20 @@ internal static class ChatIndex
             ?? new ChatState();
     }
 
-    public static int Build(string root, bool rebuild, bool includeAgents, ModelSpec spec, bool gpu)
+    public static int Build(
+        string root,
+        bool rebuild,
+        bool includeAgents,
+        TranscriptSources sources,
+        ModelSpec spec,
+        bool gpu
+    )
     {
-        var roots = new[] { Paths.ClaudeProjects, Paths.CodexSessions };
+        var roots = new List<string>();
+        if (sources.HasFlag(TranscriptSources.Claude))
+            roots.Add(Paths.ClaudeProjects);
+        if (sources.HasFlag(TranscriptSources.Codex))
+            roots.Add(Paths.CodexSessions);
         if (!roots.Any(Directory.Exists))
         {
             Console.Error.WriteLine($"transcripts not found: {string.Join(", ", roots)}");
@@ -93,13 +107,14 @@ internal static class ChatIndex
             && (
                 state.Model != spec.Name
                 || state.IncludeAgents != includeAgents
+                || state.Sources != sources
                 || state.MetaVersion != MetaVersion
             )
         )
         {
             Console.Error.WriteLine(
                 $"chats index was built with model={state.Model} includeAgents={state.IncludeAgents} "
-                    + $"metaVersion={state.MetaVersion} — rebuilding"
+                    + $"sources={state.Sources} metaVersion={state.MetaVersion} — rebuilding"
             );
             rebuild = true;
             state = new ChatState();
@@ -108,6 +123,7 @@ internal static class ChatIndex
         state.Model = spec.Name;
         state.Dim = spec.Dim;
         state.IncludeAgents = includeAgents;
+        state.Sources = sources;
         state.MetaVersion = MetaVersion;
 
         if (rebuild)
@@ -619,54 +635,44 @@ internal static class ChatIndex
         string query,
         int k,
         bool json,
-        Dictionary<ModelSpec, Task<Embedder>> embedders
+        Dictionary<ModelSpec, Task<Embedder>> embedders,
+        Stream stdout
     )
     {
-        if (specs.Length > 1)
-            return SearchFused(root, specs, query, k, json, embedders);
-
-        var rows = Rows(root, specs[0], query, k, embedders);
-        if (rows is null)
+        var hits = Hits(root, specs, query, k, embedders);
+        if (hits is null)
             return 1;
 
         if (json)
         {
-            using var output = new JsonLines();
-            foreach (var row in rows)
+            foreach (var (row, score, legs) in hits)
             {
-                var writer = output.Writer;
-                writer.WriteStartObject();
-                writer.WriteString("source"u8, row.Source);
-                writer.WriteNumber("score"u8, JsonLines.Score(row.Score));
-                writer.WriteString("file"u8, row.Path);
-                writer.WriteNumber("line"u8, row.Line);
-                writer.WriteString("uuid"u8, row.Uuid);
-                writer.WriteNumber("chunk"u8, row.Chunk);
-                writer.WriteString("session"u8, row.Session);
-                writer.WriteString("cwd"u8, row.Cwd);
-                writer.WriteString("role"u8, row.Role);
-                writer.WriteString("ts"u8, row.Ts);
-                writer.WriteString("text"u8, row.Text);
-                writer.WriteEndObject();
-                output.Flush();
+                var hit = new ChatHit(row.Source, Math.Round(score, 4), row.Path, row.Line, row.Uuid, row.Chunk,
+                    row.Session, row.Cwd, row.Role, row.Ts, row.Text, HitLeg.From(legs));
+                JsonSerializer.Serialize(stdout, hit, Ctx.Default.ChatHit);
+                stdout.WriteByte((byte)'\n');
             }
 
             return 0;
         }
 
-        Print(rows.Select(r => (r, r.Score, (List<Index.Leg>?)null)).ToList());
+        Print(hits);
         return 0;
     }
 
-    private static int SearchFused(
+    /// <summary>The top k chat items: one model's cosines, or the RRF fusion of each model's top 3k (with legs).</summary>
+    public static List<(Row Row, float Score, List<Index.Leg>? Legs)>? Hits(
         string root,
         ModelSpec[] specs,
         string query,
         int k,
-        bool json,
         Dictionary<ModelSpec, Task<Embedder>> embedders
     )
     {
+        if (specs.Length == 1)
+            return Rows(root, specs[0], query, k, embedders)
+                ?.Select(r => (r, r.Score, (List<Index.Leg>?)null)).ToList();
+
         var fused = new Dictionary<
             (string Path, long Line, int Chunk),
             (Row Row, float Score, List<Index.Leg> Legs)
@@ -692,43 +698,15 @@ internal static class ChatIndex
         }
 
         if (legs == 0)
-            return 1;
+            return null;
 
-        var hits = fused
+        return fused
             .Values.OrderByDescending(h => h.Score)
             .ThenBy(h => h.Row.Path, StringComparer.Ordinal)
             .ThenBy(h => h.Row.Line)
             .Take(k)
+            .Select(h => (h.Row, h.Score, (List<Index.Leg>?)h.Legs))
             .ToList();
-
-        if (json)
-        {
-            using var output = new JsonLines();
-            foreach (var (row, score, hitLegs) in hits)
-            {
-                var writer = output.Writer;
-                writer.WriteStartObject();
-                writer.WriteString("source"u8, row.Source);
-                writer.WriteNumber("score"u8, JsonLines.Score(score));
-                writer.WriteString("file"u8, row.Path);
-                writer.WriteNumber("line"u8, row.Line);
-                writer.WriteString("uuid"u8, row.Uuid);
-                writer.WriteNumber("chunk"u8, row.Chunk);
-                writer.WriteString("session"u8, row.Session);
-                writer.WriteString("cwd"u8, row.Cwd);
-                writer.WriteString("role"u8, row.Role);
-                writer.WriteString("ts"u8, row.Ts);
-                writer.WriteString("text"u8, row.Text);
-                Index.WriteLegs(writer, hitLegs);
-                writer.WriteEndObject();
-                output.Flush();
-            }
-
-            return 0;
-        }
-
-        Print(hits.Select(h => (h.Row, h.Score, (List<Index.Leg>?)h.Legs)).ToList());
-        return 0;
     }
 
     private static void Print(List<(Row Row, float Score, List<Index.Leg>? Legs)> hits)
@@ -747,7 +725,7 @@ internal static class ChatIndex
         }
     }
 
-    private readonly record struct Row(
+    internal readonly record struct Row(
         string Source,
         float Score,
         string Path,

@@ -65,7 +65,7 @@ Source transcripts and memories are read only; indexes are written only under th
 | `memfind <query words...> --memories` | Search memories only |
 | `memfind show <file>:<line> [-c N]` | Print that transcript message in full, with neighbours |
 | `memfind stats` | What is indexed |
-| `memfind context-hook` | Native Codex UserPromptSubmit handler, JSON on stdin/stdout |
+| `memfind context-hook` | Claude Code / Codex UserPromptSubmit hook, JSON on stdin/stdout |
 | `memfind --help` | Usage |
 
 Every command takes `--model bge|bge-fp32|gemma|both`; `bge` is the default. On `index`, `both`
@@ -88,11 +88,13 @@ builds each model in turn; on a query it searches with each and fuses the two ra
 | `--chats-only` / `--memory-only` | `index` | Skip the other half |
 | `--rebuild` | `index` | Ignore the incremental state, re-read every transcript |
 | `--no-agents` | `index` | Skip subagent transcripts and sidechain messages (indexed by default; `--include-agents` is accepted and does nothing) |
+| `--sources <list>` | `index` | `claude`, `codex` or `claude,codex` (default both). Codex means its rollouts and its memories. Changing it rebuilds the chat index and rewrites the memory index; on other commands it is validated and ignored. E.g. `memfind index --sources claude`: Codex can import Claude chats, which indexes them twice |
 | `--model <name>` | `index`, queries, `stats` | `bge` (default), `bge-fp32`, `gemma`, or `both` |
 | `--fp32` | `index` | Alias for `--model bge-fp32`; with `--model both` it is an error (exit 2) |
 | `--gpu` | `index` | Try the CUDA execution provider, fall back to CPU |
 | `--threads N` | all | Intra-op and parse threads (default: half the cores; a search uses 4 intra-op) |
 | `--offline` | all | Fail instead of downloading missing model files |
+| `--budget-ms N` | `context-hook` | Give up silently N ms after process start (default 7000) |
 
 ## Exit codes
 
@@ -143,9 +145,7 @@ header starts with `>>>` instead of `---`:
 
 One object per line (JSONL). Chat `ts` is the original transcript message timestamp;
 memory `ts` is the source file's last-write time in UTC (absent in older indexes).
-Text mode renders chat time locally. `score` is rounded to 4 decimals by default;
-`--full-precision` preserves the original scores in JSON, as used by the hook
-to apply its similarity threshold before rounding.
+Text mode renders chat time locally. `score` is rounded to 4 decimals.
 
 | Shape | Fields |
 | --- | --- |
@@ -172,7 +172,7 @@ All under `<store>/.memfind/` (with a `.gitignore` of `*`).
 | `index.json` | `{model, dim, builtAt, items:[{file, theme, title, description, vec[dim]}]}` — the memory index, read whole |
 | `chats.vec` | Raw little-endian `float32[dim]` per item, back to back; item *i* is at `i * dim * 4` bytes. Memory-mapped at search time |
 | `chats.meta.jsonl` | One object per item, in `chats.vec` order: `{i, file, source, session, cwd, role, ts, line, uuid, chunk, text}`. `file` is an absolute native path; `text` is the 300-char preview |
-| `chats.state.json` | `{model, dim, metaVersion, includeAgents, files:[{path, length, lines, lastWriteUtc, itemsFrom, itemsCount}]}` — the incremental state: bytes and lines already consumed per transcript (compressed file size for archives), and the item range they produced |
+| `chats.state.json` | `{model, dim, metaVersion, includeAgents, sources (1 claude, 2 codex, 3 both; absent means both), files:[{path, length, lines, lastWriteUtc, itemsFrom, itemsCount}]}` — the incremental state: bytes and lines already consumed per transcript (compressed file size for archives), and the item range they produced |
 
 Index progress reports processed fragments and characters per second (current interval and
 overall embedding average). Characters count the text supplied to the embedder, excluding
@@ -230,37 +230,70 @@ Measured here (RTX 5060, cuDNN 9.26, 256-token chunks, batch 64): gemma int8 13.
 vs 182.5 on CUDA; bge int8 73.8 on CPU. The gemma memory index takes 29.9 s on CPU and 4.7 s on
 GPU. Queries are ~40 ms, so search has no `--gpu`.
 
-## Codex prompt context hook
+## Prompt context hook (Claude Code and Codex)
 
-`memfind context-hook` searches existing Gemma memory and chat indexes on
-`UserPromptSubmit`. It emits Codex `additionalContext` with up to four excerpts
-and their file/line anchors, capped at 3000 characters total. It skips prompts
-shorter than 12 characters, scores below 0.38, duplicate texts, repeated files,
-and the current session/transcript. Excerpts are labelled as historical,
-untrusted reference data. Errors leave the prompt unchanged. The Codex command
-has a **ten-second timeout**; the native handler gives its search worker 9.5
-seconds including event input and preflight, then kills it and returns no context.
-It needs no Python interpreter, runs the worker with `--offline`, never indexes, and skips retrieval
-if any Gemma model file is missing/empty or neither Gemma index exists, so that
-submitting a prompt cannot download a model. The 0.38 floor is an initial local
-probe setting, not a calibrated confidence probability. Only already-built
-indexes are searched; build the chat index separately to include transcripts.
+`memfind context-hook` is the `UserPromptSubmit` hook for both Claude Code and
+Codex. It reads the hook event on stdin, searches the existing memory and chat
+indexes in-process and writes one JSON object,
+`{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":...}}`.
+It uses the `--model` value given on its command line (`bge`, `bge-fp32`, `gemma`
+or `both`) and defaults to `both`, which fuses the bge and Gemma rankings (RRF) as
+`memfind --model both` does.
 
-The hook retrieves up to 64 candidates per source, applies the raw similarity
-floor, then sorts by `score * (1 + 0.10 * 2^(-age_days / 7))`. A fresh source
-gets at most a 10% bonus, halving each week. Future dates are clamped to age zero;
-missing or invalid dates get no bonus. This reranks the candidate subset, not
-the whole corpus. Each excerpt header includes raw `score`, `rank_score` and
-valid source `ts`. Ordinary CLI search keeps its existing similarity ordering.
+`additionalContext` is one header line, then one line per hit: memories first,
+then chat transcripts, at most `-k` (default 3) of each after the filters below.
 
-Chat fragments use the original message timestamp; tool calls/results are
-excluded. Memory fragments share the file's last-write time, so editing a file
-refreshes all its passages. Run `memfind index --model gemma --memory-only` to
-update dates in older indexes: unchanged text reuses its embeddings. A date-only
-change rewrites metadata without recomputing vectors.
+```text
+  0.81  memory  some_memory.md  Title - description
+  0.90  memory  /home/me/.codex/memories/MEMORY.md:12  Heading - passage, whitespace collapsed, 160 chars...
+  0.79  chat    /home/me/.claude/projects/p/session.jsonl:628  2026-10-22 assistant [/project] - text, 160 chars...
+```
+
+The number is the gate similarity (a model cosine, never the RRF score). Store
+memories print their description whole; Codex memory passages and chat, agent,
+codex and codex-agent messages are collapsed to one line and cut at 160 characters.
+The hook skips prompts of fewer than three words, truncates the query to 2000
+characters, and drops hits below the similarity floor, repeated texts and the
+current session/transcript. The whole context is capped at 3000 characters; a
+line that would exceed it is dropped. With nothing left it writes nothing.
+Errors leave the prompt unchanged: no output, exit 0.
+
+Both hosts allow a **ten-second timeout**. `--budget-ms N` (default 7000) is
+counted from process start, so runtime startup is charged. When it runs out the
+hook writes nothing and ends the process at once with exit code 0, without
+waiting for a model load still inside ONNX Runtime. It never downloads or
+indexes, and skips retrieval if any selected model file is missing/empty or a
+selected model has neither a memory nor a chat index. Only already-built indexes
+are searched; build the chat index separately to include transcripts.
+
+The similarity floor is per model, on that model's cosine: bge and bge-fp32 0.70,
+gemma 0.38. These are the values of the earlier single-model hooks, an initial
+local probe setting, not calibrated confidence probabilities. In `both` mode a hit
+passes when at least one of its legs clears its own model's floor, and its similarity
+is the highest cosine among the legs that do. Memories keep their search-score order
+(RRF when fused, cosine for a single model). The hook retrieves 64 candidates per
+source, so this orders that candidate subset, not the whole corpus. Ordinary CLI
+search keeps its existing ordering.
+
+Chats and subagent chats get a small additive freshness bonus by default:
+`rank = RRF + boost / sqrt(1 + 3 * age_days / half_life)`.
+`--recency-boost <score>` is in RRF score units (default 0.001; 0 disables it).
+`--recency-half-life <days>` is the age at which the bonus has halved (default 21,
+must be greater than 0). With these defaults the bonus is 0.001 when fresh,
+about 0.000707 after 7 days, and 0.0005 after 21 days. It has a gradual power-law
+tail. Single-model chat hooks use `1 / (60 + retrieval_rank)` as their RRF base,
+with ranks assigned before gating. The relevance gate always runs before the bonus.
+Future dates are clamped to age zero; missing or invalid dates get no bonus.
+To disable it: `memfind context-hook --recency-boost 0`.
+
+Chat fragments use the original message timestamp; tool calls/results are excluded.
+All memory sources, including Codex memory passages, stay free of decay regardless
+of their file modification time. These options affect the context hook only;
+ordinary CLI search keeps its existing ordering.
 
 Publish and install the native executable, then merge this entry into your
-Codex home's `hooks.json` (`$CODEX_HOME` or `~/.codex`). Use an absolute executable
+Codex home's `hooks.json` (`$CODEX_HOME` or `~/.codex`), or for Claude Code into the
+`hooks` of `~/.claude/settings.json` (same shape). Use an absolute executable
 path; [hooks/hooks.example.json](hooks/hooks.example.json) is the same example:
 
 ```json
@@ -269,7 +302,7 @@ path; [hooks/hooks.example.json](hooks/hooks.example.json) is the same example:
     "UserPromptSubmit": [{
       "hooks": [{
         "type": "command",
-        "command": "/usr/local/bin/memfind context-hook",
+        "command": "/usr/local/bin/memfind context-hook --store /path/to/memory --model both",
         "timeout": 10,
         "additionalContextLimit": 3000
       }]
@@ -282,11 +315,11 @@ On Windows use `commandWindows` with the native executable path quoted as needed
 Review and trust the hook in Codex `/hooks` or the app's Hooks settings, then
 start a new chat. Codex skips untrusted hook definitions. Local command hooks
 require local orchestration; see the [official hooks documentation](https://learn.chatgpt.com/docs/hooks).
-Prepare indexes separately with `memfind index --model gemma` (or start with
-`memfind index --model gemma --memory-only` for curated memory).
+Prepare indexes separately with `memfind index --model both` (or start with
+`memfind index --model both --memory-only` for curated memory).
 
 Hook checks: `dotnet run -c Release --project tests/HookContracts/HookContracts.csproj`
-(native contract checks and a real timed-out worker; no Python).
+(native contract checks and a real worker that runs out its budget; no Python).
 
 ## Claude SessionStart hook
 

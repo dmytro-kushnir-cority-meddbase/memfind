@@ -72,6 +72,7 @@ with tempfile.TemporaryDirectory(prefix="memfind-smoke-") as directory:
     assert stats["chatItems"] == 6 and stats["transcripts"] == 4, stats
     assert stats["memories"] == 5, stats
     hits = rows("sourdough bread", "-k", "20")
+    assert rows("sourdough bread", "-k", "20", "--recency-boost", "10", "--recency-half-life", "1") == hits
     assert {h["source"] for h in hits} == {"memory", "chat", "agent", "codex", "codex-agent"}, hits
     assert len([h for h in hits if h["source"] != "memory"]) == 6
     assert not any("DO_NOT_INDEX" in h.get("text", h.get("description", "")) for h in hits)
@@ -129,6 +130,41 @@ with tempfile.TemporaryDirectory(prefix="memfind-smoke-") as directory:
     run("bread", "--chats", code=1)
     run("index")
     assert rows("stats")[0]["metaVersion"] == 3
+    # --sources picks which transcript roots are indexed; Codex memory counts as Codex.
+    other = ["--store", str(root / "sources-store")]
+    (root / "sources-store").mkdir()
+    (root / "sources-store/MEMORY.md").write_text("- [Kubernetes rollout](kubernetes.md)\n")
+    shutil.copyfile(store / "kubernetes.md", root / "sources-store/kubernetes.md")
+    assert "rebuilding" not in run("index", *other).stderr
+    stats = rows("stats", *other)[0]
+    assert stats["chatItems"] == 6 and stats["memories"] == 4, stats
+    assert "sources=All" in run("index", "--sources", "claude", *other).stderr
+    stats = rows("stats", *other)[0]
+    assert stats["chatItems"] == 3 and stats["transcripts"] == 2 and stats["memories"] == 1, stats
+    assert {h["source"] for h in rows("bread", "--chats", "-k", "20", *other)} <= {"chat", "agent"}
+    assert all(h["theme"] != "codex" for h in rows("sourdough bread", "--memories", "-k", "20", *other))
+    stderr = run("index", "--sources", "claude", *other).stderr
+    assert "rebuilding" not in stderr and "read 0 file(s)" in stderr, stderr
+    run("stats", "--sources", "claude")
+    assert "sources=Claude " in run("index", "--sources", "claude,codex", *other).stderr
+    stats = rows("stats", *other)[0]
+    assert stats["chatItems"] == 6 and stats["memories"] == 4, stats
+    assert "rebuilding" in run("index", "--sources", "codex", *other).stderr
+    stats = rows("stats", *other)[0]
+    assert stats["chatItems"] == 3 and stats["memories"] == 4, stats
+    assert {h["source"] for h in rows("bread", "--chats", "-k", "20", *other)} <= {"codex", "codex-agent"}
+    # An index state written before --sources existed means both, and is not rebuilt.
+    run("index", *other)
+    state_path = root / "sources-store/.memfind/chats.state.json"
+    state = json.loads(state_path.read_text())
+    del state["sources"]
+    state_path.write_text(json.dumps(state))
+    assert "rebuilding" not in run("index", *other).stderr
+    assert rows("stats", *other)[0]["chatItems"] == 6
+    for bad in ("foo", "", "claude,", "claude,foo"):
+        run("index", "--sources", bad, *other, code=2)
+    run("index", "--sources", *other, code=2)
+    run("index", "--sources", "claude", "--claude-projects", str(root / "absent"), *other, code=1)
     fused = rows("bread", "--model", "both", "-k", "20")
     assert all(h["models"][0]["model"] == "bge" for h in fused)
     missing = root / "missing"

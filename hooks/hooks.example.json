@@ -3,7 +3,7 @@
     "UserPromptSubmit": [{
       "hooks": [{
         "type": "command",
-        "command": "/usr/local/bin/memfind context-hook",
+        "command": "/usr/local/bin/memfind context-hook --store /path/to/memory --model both",
         "timeout": 10,
         "additionalContextLimit": 3000
       }]

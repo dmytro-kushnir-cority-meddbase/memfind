@@ -1,18 +1,21 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
 namespace MemFind;
 
 /// <summary>Prints the message a hit's <c>path:line</c> anchor points at, with its neighbours.</summary>
 internal static class Show
 {
-    private sealed record Shown(
-        string Role,
-        string Ts,
-        long Line,
-        string Uuid,
-        bool Anchor,
-        string Text
+    internal sealed record Shown(
+        [property: JsonPropertyName("role")] string Role,
+        [property: JsonPropertyName("ts")] string Ts,
+        [property: JsonPropertyName("line")] long Line,
+        [property: JsonPropertyName("uuid")] string Uuid,
+        [property: JsonPropertyName("anchor")] bool Anchor,
+        [property: JsonPropertyName("text")] string Text
     );
 
-    public static int Run(string path, long anchor, int context, bool json, bool includeAgents)
+    public static int Run(string path, long anchor, int context, bool json, bool includeAgents, Stream stdout)
     {
         if (!File.Exists(path))
         {
@@ -46,19 +49,10 @@ internal static class Show
 
         if (json)
         {
-            using var output = new JsonLines();
             foreach (var message in messages)
             {
-                var writer = output.Writer;
-                writer.WriteStartObject();
-                writer.WriteString("role"u8, message.Role);
-                writer.WriteString("ts"u8, message.Ts);
-                writer.WriteNumber("line"u8, message.Line);
-                writer.WriteString("uuid"u8, message.Uuid);
-                writer.WriteBoolean("anchor"u8, message.Anchor);
-                writer.WriteString("text"u8, message.Text);
-                writer.WriteEndObject();
-                output.Flush();
+                JsonSerializer.Serialize(stdout, message, Ctx.Default.Shown);
+                stdout.WriteByte((byte)'\n');
             }
 
             return 0;

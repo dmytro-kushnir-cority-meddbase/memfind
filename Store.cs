@@ -33,7 +33,7 @@ internal static class Store
 {
     public static string DefaultRoot => Paths.Store;
 
-    public static List<MemoryDoc> Parse(string root)
+    public static List<MemoryDoc> Parse(string root, TranscriptSources sources)
     {
         var placement = BuildPlacement(root);
         var docs = new List<MemoryDoc>();
@@ -68,7 +68,8 @@ internal static class Store
                 Timestamp: File.GetLastWriteTimeUtc(path)));
         }
 
-        docs.AddRange(ParseCodex(Paths.CodexMemories));
+        if (sources.HasFlag(TranscriptSources.Codex))
+            docs.AddRange(ParseCodex(Paths.CodexMemories));
         return docs;
     }
 

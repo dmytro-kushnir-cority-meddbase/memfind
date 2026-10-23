@@ -1,5 +1,3 @@
-using System.Buffers;
-using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace MemFind;
@@ -7,38 +5,45 @@ namespace MemFind;
 [JsonSourceGenerationOptions(WriteIndented = false)]
 [JsonSerializable(typeof(IndexFile))]
 [JsonSerializable(typeof(ChatState))]
+[JsonSerializable(typeof(MemoryHit))]
+[JsonSerializable(typeof(ChatHit))]
+[JsonSerializable(typeof(Show.Shown))]
 internal sealed partial class Ctx : JsonSerializerContext;
 
-/// <summary>One JSON object per stdout line, written straight as UTF-8 (no reflection, AOT-safe).</summary>
-internal sealed class JsonLines : IDisposable
+/// <summary>One leg of a fused hit; scores in every hit record are rounded to 4 decimals.</summary>
+internal sealed record HitLeg(
+    [property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("score")] double Score,
+    [property: JsonPropertyName("rank")] int Rank
+)
 {
-    public static bool FullPrecision { get; set; }
-    public static double Score(float score) => FullPrecision ? score : Math.Round(score, 4);
-    private readonly Stream _stream = Console.OpenStandardOutput();
-    private readonly ArrayBufferWriter<byte> _buffer = new(4096);
-    private readonly Utf8JsonWriter _writer;
-
-    public JsonLines()
-    {
-        _writer = new Utf8JsonWriter(_buffer, new JsonWriterOptions { SkipValidation = true });
-    }
-
-    public Utf8JsonWriter Writer => _writer;
-
-    /// <summary>Ends the object started on <see cref="Writer"/> and emits it as one line.</summary>
-    public void Flush()
-    {
-        _writer.Flush();
-        _stream.Write(_buffer.WrittenSpan);
-        _stream.WriteByte((byte)'\n');
-        _buffer.Clear();
-        _writer.Reset(_buffer);
-    }
-
-    public void Dispose()
-    {
-        // The stream is stdout itself; flush it but never close the handle — `--all` opens it twice.
-        _writer.Dispose();
-        _stream.Flush();
-    }
+    public static List<HitLeg>? From(List<Index.Leg>? legs) =>
+        legs?.Select(leg => new HitLeg(leg.Model, Math.Round(leg.Score, 4), leg.Rank)).ToList();
 }
+
+internal sealed record MemoryHit(
+    [property: JsonPropertyName("source")] string Source,
+    [property: JsonPropertyName("score")] double Score,
+    [property: JsonPropertyName("file")] string File,
+    [property: JsonPropertyName("line")] int Line,
+    [property: JsonPropertyName("ts"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] DateTimeOffset? Ts,
+    [property: JsonPropertyName("theme")] string Theme,
+    [property: JsonPropertyName("title")] string Title,
+    [property: JsonPropertyName("description")] string Description,
+    [property: JsonPropertyName("models"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<HitLeg>? Models
+);
+
+internal sealed record ChatHit(
+    [property: JsonPropertyName("source")] string Source,
+    [property: JsonPropertyName("score")] double Score,
+    [property: JsonPropertyName("file")] string File,
+    [property: JsonPropertyName("line")] long Line,
+    [property: JsonPropertyName("uuid")] string Uuid,
+    [property: JsonPropertyName("chunk")] int Chunk,
+    [property: JsonPropertyName("session")] string Session,
+    [property: JsonPropertyName("cwd")] string Cwd,
+    [property: JsonPropertyName("role")] string Role,
+    [property: JsonPropertyName("ts")] string Ts,
+    [property: JsonPropertyName("text")] string Text,
+    [property: JsonPropertyName("models"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] List<HitLeg>? Models
+);

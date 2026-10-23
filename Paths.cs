@@ -1,5 +1,14 @@
 namespace MemFind;
 
+/// <summary>Transcript sources `index --sources` selects; Codex covers its sessions and its memories.</summary>
+[Flags]
+internal enum TranscriptSources
+{
+    Claude = 1,
+    Codex = 2,
+    All = Claude | Codex,
+}
+
 internal static class Paths
 {
     private static string Home => Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
