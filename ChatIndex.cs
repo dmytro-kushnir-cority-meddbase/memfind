@@ -552,8 +552,7 @@ internal static class ChatIndex
         var vectorBytes = loaded.Dim * sizeof(float);
         var count = (int)(new FileInfo(vec).Length / vectorBytes);
 
-        var embedder = Embedder.ForQuery(embedders, loaded);
-        var q = embedder.EmbedQuery(query);
+        var q = Embedder.QueryVector(embedders, loaded, query);
 
         var heap = new TopK(k);
 

@@ -66,6 +66,7 @@ Source transcripts and memories are read only; indexes are written only under th
 | `memfind show <file>:<line> [-c N]` | Print that transcript message in full, with neighbours |
 | `memfind stats` | What is indexed |
 | `memfind context-hook` | Claude Code / Codex UserPromptSubmit hook, JSON on stdin/stdout |
+| `memfind serve` | Keep gemma's query session loaded; `context-hook` asks it over a per-user named pipe, starts one when none is listening, and embeds in-process until it answers |
 | `memfind --help` | Usage |
 
 Every command takes `--model bge|bge-fp32|gemma|both`; `bge` is the default. On `index`, `both`
@@ -95,6 +96,7 @@ builds each model in turn; on a query it searches with each and fuses the two ra
 | `--threads N` | all | Intra-op and parse threads (default: half the cores; a search uses 4 intra-op) |
 | `--offline` | all | Fail instead of downloading missing model files |
 | `--budget-ms N` | `context-hook` | Give up silently N ms after process start (default 7000) |
+| `--idle-minutes N` | `serve` | Exit after N minutes without a query (default 30) |
 
 ## Exit codes
 

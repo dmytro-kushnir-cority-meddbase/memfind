@@ -138,6 +138,8 @@ internal sealed class Embedder : IDisposable
         set => _threads = _queryThreads = Math.Max(1, value);
     }
 
+    public static int QueryThreads => _queryThreads;
+
     /// <summary>
     /// BertTokenizer hides the base truncating overload with one that adds [CLS]/[SEP], so the two
     /// tokenizers are bound at their own type and reached through this, never through Tokenizer.
@@ -197,12 +199,19 @@ internal sealed class Embedder : IDisposable
         _padId = spec.PadId;
     }
 
+    /// <summary>Query vectors computed elsewhere (the serve host); a model listed here is never loaded.</summary>
+    public static Dictionary<ModelSpec, float[]> QueryVectors { get; } = [];
+
     /// <summary>Starts a background load of the query session for <paramref name="spec"/>, once.</summary>
     public static void Preload(Dictionary<ModelSpec, Task<Embedder>> embedders, ModelSpec spec)
     {
-        if (!embedders.ContainsKey(spec))
+        if (!embedders.ContainsKey(spec) && !QueryVectors.ContainsKey(spec))
             embedders[spec] = Task.Run(() => Load(spec, query: true));
     }
+
+    /// <summary>The query vector for <paramref name="spec"/>: a precomputed one, else the query session's.</summary>
+    public static float[] QueryVector(Dictionary<ModelSpec, Task<Embedder>> embedders, ModelSpec spec, string query) =>
+        QueryVectors.TryGetValue(spec, out var vector) ? vector : ForQuery(embedders, spec).EmbedQuery(query);
 
     /// <summary>The query session for <paramref name="spec"/>: the preloaded one, else loaded now.</summary>
     public static Embedder ForQuery(Dictionary<ModelSpec, Task<Embedder>> embedders, ModelSpec spec)
@@ -331,7 +340,7 @@ internal sealed class Embedder : IDisposable
     [DllImport("onnxruntime")]
     private static extern nint OrtGetApiBase();
 
-    private static unsafe string BuildInfo()
+    internal static unsafe string BuildInfo()
     {
         // OrtApiBase.GetApi, then OrtApi slot 254 = GetBuildInfoString (onnxruntime_c_api.h, since
         // API 15); the managed API does not expose it.

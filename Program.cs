@@ -18,6 +18,7 @@ var json = false;
 var context = 3;
 var recency = new RecencyOptions();
 var budgetMs = 7000;
+var idleMinutes = 30;
 
 for (var i = 0; i < args.Length; i++)
 {
@@ -157,6 +158,14 @@ for (var i = 0; i < args.Length; i++)
             }
             break;
 
+        case "--idle-minutes":
+            if (i + 1 >= args.Length || !int.TryParse(args[++i], out idleMinutes) || idleMinutes < 1)
+            {
+                Console.Error.WriteLine("--idle-minutes needs a positive integer");
+                return 2;
+            }
+            break;
+
         case "--threads":
             if (i + 1 >= args.Length || !int.TryParse(args[++i], out var threads) || threads < 1)
             {
@@ -234,6 +243,9 @@ if (words.Count == 1 && words[0] == "context-hook")
     return ContextHook.Run(store, model is null ? ModelSpec.Indexes : specs, recency,
         args.Contains("-k") ? k : 3, budgetMs, stdout);
 }
+
+if (words.Count == 1 && words[0] == "serve")
+    return ContextHook.Serve(idleMinutes);
 
 if (words.Count == 1 && words[0] == "index")
 {
@@ -449,6 +461,9 @@ static void Usage()
           memfind stats                        what is indexed
           memfind context-hook [options]       Claude Code / Codex prompt hook (stdin/stdout JSON);
                                                --model defaults to both, -k to 3 per source
+          memfind serve [--idle-minutes N]     keep gemma's query session loaded for context-hook;
+                                               context-hook starts it when absent; exits after
+                                               N idle minutes (default 30)
           memfind --help                       this screen
 
         Index options:

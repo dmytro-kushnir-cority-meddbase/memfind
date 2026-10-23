@@ -230,8 +230,7 @@ internal static class Index
             return null;
         }
 
-        var embedder = Embedder.ForQuery(embedders, ModelSpec.ByName(index.Model) ?? spec);
-        var q = embedder.EmbedQuery(query);
+        var q = Embedder.QueryVector(embedders, ModelSpec.ByName(index.Model) ?? spec, query);
 
         return index
             .Items.Select(item => (Item: item, Score: Dot(q, item.Vec)))
