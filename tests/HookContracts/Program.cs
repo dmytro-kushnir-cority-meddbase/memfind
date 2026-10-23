@@ -1,4 +1,7 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -204,6 +207,8 @@ try
     Check(LockProbe(root) == "acquired", "disposing releases writer lock");
     MetadataContracts(root);
     TranscriptContracts();
+    await ResidentContracts();
+    await QueueContracts(Path.Combine(root, "queues"));
 
     // Store descriptions print whole, so long ones are what the character budget has to drop.
     var wide = Enumerable.Range(0, 3).Select(i => Memory($"w{i}.md", i + new string('x', 1400), .9f)).ToArray();
@@ -265,7 +270,7 @@ try
         finally { if (!skipWorker.HasExited) skipWorker.Kill(entireProcessTree: true); }
         Check(skipWorker.ExitCode == 0 && await skipWorker.StandardOutput.ReadToEndAsync() == "", "short prompt is skipped");
     }
-    Console.WriteLine("PASS: hook format, gates, recency, metadata-only migration, transcript filtering, store locks, context budgets, offline preflight and deadline exit");
+    Console.WriteLine("PASS: hook format, gates, recency, metadata-only migration, transcript filtering, store locks, resident IPC, context budgets, offline preflight and deadline exit");
 }
 finally
 {
@@ -273,6 +278,111 @@ finally
 }
 
 static JsonElement Element(object value) => JsonSerializer.SerializeToElement(value);
+
+static async Task ResidentContracts()
+{
+    // A real pipe catches platform-specific discovery failures without loading a model.
+    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+    var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    const string query = "A multilingual query: память 🐱";
+    var expected = Enumerable.Range(0, ModelSpec.Gemma.Dim).Select(i => i / 1024f).ToArray();
+    var serving = Task.Run(() =>
+    {
+        using var host = ContextHook.TryAcquireHostLock();
+        Check(host is not null, "isolated resident test lock");
+        using var pipe = new NamedPipeServerStream(ContextHook.PipeName, PipeDirection.InOut, 1,
+            PipeTransmissionMode.Byte, PipeOptions.CurrentUserOnly | PipeOptions.Asynchronous);
+        ready.SetResult();
+        pipe.WaitForConnectionAsync(deadline.Token).GetAwaiter().GetResult();
+        var length = new byte[4];
+        pipe.ReadExactlyAsync(length, deadline.Token).AsTask().GetAwaiter().GetResult();
+        var text = new byte[BinaryPrimitives.ReadInt32LittleEndian(length)];
+        pipe.ReadExactlyAsync(text, deadline.Token).AsTask().GetAwaiter().GetResult();
+        Check(Encoding.UTF8.GetString(text) == query, "resident receives the exact UTF-8 query");
+        pipe.Write(MemoryMarshal.AsBytes(expected.AsSpan()));
+    });
+    try
+    {
+        await ready.Task.WaitAsync(deadline.Token);
+        var actual = ContextHook.Served(query);
+        Check(actual is not null && actual.SequenceEqual(expected), "hook uses an existing resident pipe on this OS");
+        await serving;
+    }
+    finally
+    {
+        deadline.Cancel();
+        try { await serving; }
+        catch (OperationCanceledException) { }
+    }
+}
+
+static async Task QueueContracts(string root)
+{
+    var queue = new IndexQueue(root, ["gemma"]);
+    using var entered = new ManualResetEventSlim();
+    using var release = new ManualResetEventSlim();
+    var passes = 0;
+    queue.Request(() => { });
+    var running = Task.Run(() => queue.Drain(() =>
+    {
+        if (Interlocked.Increment(ref passes) == 1)
+        {
+            entered.Set();
+            Check(release.Wait(TimeSpan.FromSeconds(5)), "release paused indexing pass");
+        }
+        return 0;
+    }));
+    try
+    {
+        Check(entered.Wait(TimeSpan.FromSeconds(5)), "first indexing pass started");
+        for (var i = 0; i < 20; i++)
+            queue.Request(() => throw new Exception("busy worker must not be started again"));
+    }
+    finally { release.Set(); }
+    Check(await running.WaitAsync(TimeSpan.FromSeconds(5)) == 0 && passes == 2,
+        "requests during indexing coalesce into one more pass");
+    Check(!File.Exists(queue.Requested), "successful drain consumes requests");
+
+    queue.Request(() => { });
+    Check(queue.Drain(() => 1) == 1 && File.Exists(queue.Requested), "failed pass retains its request");
+    Check(queue.Drain(() => 0) == 0 && !File.Exists(queue.Requested), "next worker retries retained request");
+
+    var held = IndexLock.TryAcquire(root)!;
+    queue.Request(() => { });
+    var builds = 0;
+    var waiting = Task.Run(() => queue.Drain(() => { Interlocked.Increment(ref builds); return 0; }));
+    try
+    {
+        await Task.Delay(100);
+        Check(Volatile.Read(ref builds) == 0, "background worker waits for a foreground writer");
+    }
+    finally { held.Dispose(); }
+    Check(await waiting.WaitAsync(TimeSpan.FromSeconds(5)) == 0 && builds == 1,
+        "background worker proceeds when foreground writer releases lock");
+
+    var version = 0;
+    var indexed = 0;
+    var active = 0;
+    var workers = new List<Task<int>>();
+    for (var i = 0; i < 100; i++)
+    {
+        Interlocked.Increment(ref version);
+        queue.Request(() => workers.Add(Task.Run(() => queue.Drain(() =>
+        {
+            Check(Interlocked.Increment(ref active) == 1, "one indexing writer at a time");
+            Volatile.Write(ref indexed, Volatile.Read(ref version));
+            Thread.Yield();
+            Interlocked.Decrement(ref active);
+            return 0;
+        }))));
+        Thread.Yield();
+    }
+    await Task.WhenAll(workers).WaitAsync(TimeSpan.FromSeconds(10));
+    Check(indexed == version && !File.Exists(queue.Requested), "concurrent request/drain completion loses no wakeups");
+
+    Check(BackgroundProcess.QuoteWindowsArgument("C:\\a b\\") == "\"C:\\a b\\\\\"", "Windows trailing slash is escaped");
+    Check(BackgroundProcess.QuoteWindowsArgument("a\"b") == "\"a\\\"b\"", "Windows quote is escaped");
+}
 static (IndexItem Item, float Score, List<MemFind.Index.Leg>? Legs) Memory(string file, string description, float score,
     int line = 0, DateTimeOffset? timestamp = null) =>
     (new IndexItem { File = file, Line = line, Title = "Title " + file, Description = description, Timestamp = timestamp }, score, null);

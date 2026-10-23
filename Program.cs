@@ -1,6 +1,8 @@
 using System.Globalization;
 using MemFind;
 
+args = BackgroundProcess.Initialize(args);
+
 var store = Store.DefaultRoot;
 var k = 5;
 var words = new List<string>();
@@ -210,17 +212,36 @@ if (fp32)
     model = "bge-fp32";
 }
 
+var allowedKeys = Environment.GetEnvironmentVariable("MEMFIND_MODELS");
+var enabled = string.IsNullOrWhiteSpace(allowedKeys) ? ModelSpec.Indexes
+    : allowedKeys.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+        .Select(ModelSpec.ByKey).Distinct().ToArray();
+if (enabled.Length == 0 || enabled.Any(spec => spec is null))
+{
+    Console.Error.WriteLine($"MEMFIND_MODELS needs a comma-separated list of {ModelSpec.Keys}");
+    return 2;
+}
+var enabledModels = enabled.Select(spec => spec!).ToArray();
+var indexHook = words.Count == 1 && words[0] is "index-hook" or "index-worker";
+if (indexHook && model is null)
+    model = "gemma";
+
 ModelSpec[] specs;
 if (model is null)
 {
-    specs = [ModelSpec.Default];
+    specs = [enabledModels.Contains(ModelSpec.Default) ? ModelSpec.Default : enabledModels[0]];
 }
 else if (model == "both")
 {
-    specs = ModelSpec.Indexes;
+    specs = enabledModels;
 }
 else if (ModelSpec.ByKey(model) is { } picked)
 {
+    if (!enabledModels.Contains(picked))
+    {
+        Console.Error.WriteLine($"Model {model} is disabled by MEMFIND_MODELS");
+        return 2;
+    }
     specs = [picked];
 }
 else
@@ -240,12 +261,39 @@ using var stdout = new BufferedStream(Console.OpenStandardOutput());
 if (words.Count == 1 && words[0] == "context-hook")
 {
     // The hook's own default is three hits per source, not the CLI's five.
-    return ContextHook.Run(store, model is null ? ModelSpec.Indexes : specs, recency,
+    return ContextHook.Run(store, model is null ? enabledModels : specs, recency,
         args.Contains("-k") ? k : 3, budgetMs, stdout);
 }
 
 if (words.Count == 1 && words[0] == "serve")
+{
+    if (!enabledModels.Contains(ModelSpec.Gemma))
+    {
+        Console.Error.WriteLine("Gemma is disabled by MEMFIND_MODELS");
+        return 2;
+    }
     return ContextHook.Serve(idleMinutes);
+}
+
+if (indexHook)
+{
+    // Capture effective options, including source roots, before starting an independent worker.
+    var options = new List<string>
+    {
+        "--store", store, "--model", specs.Length == 1 ? specs[0].Key : "both",
+        "--sources", sources == TranscriptSources.All ? "claude,codex" : sources == TranscriptSources.Claude ? "claude" : "codex",
+        "--claude-projects", Paths.ClaudeProjects, "--codex-sessions", Paths.CodexSessions,
+        "--codex-memories", Paths.CodexMemories, "--threads", Embedder.Threads.ToString(CultureInfo.InvariantCulture),
+        "--offline",
+    };
+    if (chatsOnly) options.Add("--chats-only");
+    if (memoryOnly) options.Add("--memory-only");
+    if (rebuild) options.Add("--rebuild");
+    if (!includeAgents) options.Add("--no-agents");
+    if (gpu) options.Add("--gpu");
+    Embedder.AllowDownloads = false;
+    return IndexHook.Run(store, options.ToArray(), BuildIndexes, words[0] == "index-worker");
+}
 
 if (words.Count == 1 && words[0] == "index")
 {
@@ -257,6 +305,14 @@ if (words.Count == 1 && words[0] == "index")
         return 0;
     }
 
+    return BuildIndexes();
+}
+
+if (words.Count == 1 && words[0] == "stats")
+    return Stats(store, json, stdout, enabledModels);
+
+int BuildIndexes()
+{
     var code = 0;
     foreach (var spec in specs)
     {
@@ -269,9 +325,6 @@ if (words.Count == 1 && words[0] == "index")
     }
     return code;
 }
-
-if (words.Count == 1 && words[0] == "stats")
-    return Stats(store, json, stdout);
 
 if (words.Count > 0 && words[0] == "show")
 {
@@ -328,9 +381,9 @@ finally
     Embedder.DisposeAll(embedders);
 }
 
-static int Stats(string store, bool json, Stream stdout)
+static int Stats(string store, bool json, Stream stdout, ModelSpec[] enabledModels)
 {
-    var counts = ModelSpec.Indexes.Select(spec => Count(store, spec)).ToList();
+    var counts = enabledModels.Select(spec => Count(store, spec)).ToList();
     var main = counts[0];
 
     if (json)
@@ -453,6 +506,8 @@ static void Usage()
         memfind — semantic search over memories, Claude Code and Codex transcripts
 
           memfind index [options]              build both indexes (<store>/.memfind/)
+          memfind index-hook [options]         enqueue detached incremental indexing (Gemma by default);
+                                               SessionStart/PreCompact hook event on stdin
           memfind <query words...> [-k N]      search memories, chats and agent chats; default k=5
           memfind ... --model bge|gemma|both   which model to index/search with
           memfind <query words...> --chats     search chat transcripts only (main and agent)
@@ -494,6 +549,8 @@ static void Usage()
           --recency-half-life <days>   context-hook only: age at half the power-law bonus
                            (default: 21, > 0); bonus = boost / sqrt(1 + 3 * age / days)
           --model <name>   bge (default), bge-fp32, gemma, or both
+                           MEMFIND_MODELS limits enabled models; the first enabled model
+                           is the default when bge is disabled; both uses enabled models
           --chats, --chats-only     search chat transcripts only (main and agent)
           --memories, --memory-only search memories only
           --all            search everything (the default)

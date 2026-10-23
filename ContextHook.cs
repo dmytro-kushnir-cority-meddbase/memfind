@@ -82,36 +82,6 @@ internal static partial class ContextHook
     [LibraryImport("libc")]
     private static partial void _exit(int status);
 
-    private const uint DetachedProcess = 0x8;
-    private const uint CreateNewProcessGroup = 0x200;
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct StartupInfo
-    {
-        public int Size;
-        public nint Reserved, Desktop, Title;
-        public int X, Y, XSize, YSize, XCountChars, YCountChars, FillAttribute, Flags;
-        public short ShowWindow, Reserved2Size;
-        public nint Reserved2, StdInput, StdOutput, StdError;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ProcessInformation
-    {
-        public nint Process, Thread;
-        public int ProcessId, ThreadId;
-    }
-
-    [LibraryImport("kernel32.dll", EntryPoint = "CreateProcessW", StringMarshalling = StringMarshalling.Utf16)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool CreateProcess(string? application, char[] commandLine, nint processAttributes,
-        nint threadAttributes, [MarshalAs(UnmanagedType.Bool)] bool inheritHandles, uint flags, nint environment,
-        string? directory, in StartupInfo startup, out ProcessInformation information);
-
-    [LibraryImport("kernel32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool CloseHandle(nint handle);
-
     private static string? Context(string store, ModelSpec[] specs, RecencyOptions recency, int k)
     {
         // Runs on the work task, so an open stdin is bounded by the caller's deadline.
@@ -174,37 +144,27 @@ internal static partial class ContextHook
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "memfind",
             ModelSpec.Gemma.Name);
         var key = new StringBuilder(Embedder.BuildInfo()).Append('|').Append(Embedder.QueryThreads);
-        foreach (var file in ModelSpec.Gemma.Files.Select(f => Path.Combine(dir, f.File)).Append(Environment.ProcessPath!))
+        var program = Environment.ProcessPath!;
+        var files = ModelSpec.Gemma.Files.Select(f => Path.Combine(dir, f.File)).Append(program);
+        if (Path.GetFileNameWithoutExtension(program).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+            files = files.Append(Path.GetFullPath(Environment.GetCommandLineArgs()[0]));
+        foreach (var file in files)
         {
             var info = new FileInfo(file);
-            key.Append('|').Append(info.Exists ? info.Length : -1).Append('|').Append(info.LastWriteTimeUtc.Ticks);
+            key.Append('|').Append(info.FullName).Append('|').Append(info.Exists ? info.Length : -1)
+                .Append('|').Append(info.LastWriteTimeUtc.Ticks);
         }
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(key.ToString())))[..12];
     }
 
     /// <summary>The gemma query vector from a running `memfind serve`, or null to embed in-process.</summary>
-    private static float[]? Served(string query)
+    internal static float[]? Served(string query)
     {
         try
         {
-            // Listing \\.\pipe\ does not open the pipe, so it costs the host no instance.
-            if (!Directory.EnumerateFiles(@"\\.\pipe\", PipeName).Any())
+            if (!HostRunning())
             {
-                var spawn = Stopwatch.StartNew();
-                // Process.Start always inherits handles, and a host holding the hook's stdout would stall
-                // every prompt; ShellExecute avoids that but costs ~70 ms.
-                var startup = new StartupInfo { Size = Marshal.SizeOf<StartupInfo>() };
-                // Same --threads, so the host lands on this hook's tag; the exe's folder, so it never pins the
-                // hook's working directory.
-                if (CreateProcess(null, string.Create(CultureInfo.InvariantCulture,
-                            $"\"{Environment.ProcessPath}\" serve --threads {Embedder.QueryThreads}\0").ToCharArray(),
-                        0, 0, false, DetachedProcess | CreateNewProcessGroup, 0,
-                        Path.GetDirectoryName(Environment.ProcessPath), startup, out var created))
-                {
-                    CloseHandle(created.Process);
-                    CloseHandle(created.Thread);
-                    _started = string.Create(CultureInfo.InvariantCulture, $"started({spawn.ElapsedMilliseconds}ms)");
-                }
+                StartHost();
                 return null;
             }
             var text = StrictUtf8.GetBytes(query);
@@ -226,17 +186,53 @@ internal static partial class ContextHook
         }
     }
 
+    private static bool HostRunning()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // Listing does not open the pipe, so it costs the host no instance.
+            return Directory.EnumerateFiles(@"\\.\pipe\", PipeName).Any();
+        }
+
+        // NativeAOT's Unix named mutexes are process-local. The host holds a file lock even
+        // while loading Gemma; socket filenames and the runtime implementation stay private.
+        using var available = TryAcquireHostLock();
+        return available is null;
+    }
+
+    internal static IDisposable? TryAcquireHostLock()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            var cache = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            return FileLock.TryAcquire(Path.Combine(cache, "memfind", "hosts", PipeName + ".lock"));
+        }
+
+        var mutex = new Mutex(false, @"Local\" + PipeName);
+        try
+        {
+            if (mutex.WaitOne(0))
+                return mutex;
+        }
+        catch (AbandonedMutexException) { return mutex; }
+        mutex.Dispose();
+        return null;
+    }
+
+    private static void StartHost()
+    {
+        var spawn = Stopwatch.StartNew();
+        if (BackgroundProcess.Start(["serve", "--threads", Embedder.QueryThreads.ToString(CultureInfo.InvariantCulture), "--offline"]) is { } pid)
+            _started = string.Create(CultureInfo.InvariantCulture, $"started(pid={pid},{spawn.ElapsedMilliseconds}ms)");
+    }
+
     /// <summary>Holds gemma's query session and answers <see cref="Served"/> until idle for <paramref name="idleMinutes"/>.</summary>
     public static int Serve(int idleMinutes)
     {
         // One host per tag; a second one, e.g. from concurrent hooks, leaves quietly.
-        using var single = new Mutex(false, @"Local\" + PipeName);
-        try
-        {
-            if (!single.WaitOne(0))
-                return 0;
-        }
-        catch (AbandonedMutexException) { }
+        using var single = TryAcquireHostLock();
+        if (single is null)
+            return 0;
 
         // The hook's own load path, so a served vector matches an in-process one bit for bit.
         var embedder = Embedder.Load(ModelSpec.Gemma, query: true);
