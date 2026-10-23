@@ -1,6 +1,8 @@
 using System.Globalization;
 using MemFind;
 
+args = BackgroundProcess.Initialize(args);
+
 var store = Store.DefaultRoot;
 var k = 5;
 var words = new List<string>();

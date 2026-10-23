@@ -37,12 +37,31 @@ internal static partial class BackgroundProcess
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool CloseHandle(nint handle);
 
+    [LibraryImport("libc", SetLastError = true)]
+    private static partial int setsid();
+
+    public static string[] Initialize(string[] arguments)
+    {
+        if (OperatingSystem.IsWindows() || arguments.Length == 0 || arguments[0] != "--background")
+            return arguments;
+        if (setsid() < 0)
+            throw new IOException($"Could not detach background session: errno {Marshal.GetLastPInvokeError()}");
+        // The launcher waits for this acknowledgement before returning to its caller. Its private
+        // stdout pipe is never used again: workers log to files, and serve has no stdout protocol.
+        Console.WriteLine("memfind-background-ready");
+        Console.Out.Flush();
+        Console.SetOut(TextWriter.Null);
+        return arguments[1..];
+    }
+
     public static int? Start(IEnumerable<string> arguments)
     {
         var program = Environment.ProcessPath!;
         var args = new List<string>();
         if (Path.GetFileNameWithoutExtension(program).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
             args.Add(Path.GetFullPath(Environment.GetCommandLineArgs()[0]));
+        if (!OperatingSystem.IsWindows())
+            args.Add("--background");
         args.AddRange(arguments);
         int pid;
         if (OperatingSystem.IsWindows())
@@ -59,21 +78,24 @@ internal static partial class BackgroundProcess
         }
         else
         {
-            // Pass paths as argv, never shell text. exec keeps the PID; /dev/null survives the hook
-            // exiting, unlike redirected .NET pipes. Ignore terminal hangup and release the caller's cwd.
+            // Pass paths as argv, never shell text. exec keeps the PID; Initialize detaches the
+            // session before acknowledging startup. Only stdout remains a private readiness pipe.
             var start = new ProcessStartInfo("/bin/sh")
             {
                 UseShellExecute = false, WorkingDirectory = AppContext.BaseDirectory,
                 RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
             };
             start.ArgumentList.Add("-c");
-            start.ArgumentList.Add("trap '' HUP; exec \"$@\" </dev/null >/dev/null 2>&1");
+            start.ArgumentList.Add("trap '' HUP; exec \"$@\" </dev/null 2>/dev/null");
             start.ArgumentList.Add("memfind-background");
             start.ArgumentList.Add(program);
             foreach (var arg in args)
                 start.ArgumentList.Add(arg);
             using var child = Process.Start(start);
             if (child is null)
+                return null;
+            var ready = child.StandardOutput.ReadLineAsync();
+            if (!ready.Wait(TimeSpan.FromSeconds(2)) || ready.Result != "memfind-background-ready")
                 return null;
             pid = child.Id;
         }

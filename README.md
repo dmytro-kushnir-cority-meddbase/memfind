@@ -367,6 +367,8 @@ The hook reads its event, leaves a request marker and launches an independent
 survives the originating chat ending (ordinary Codex async hooks are cancelled
 with their session). Workers are always offline and default to Gemma. They
 capture the store, source roots, model and indexing options from the launcher.
+On Unix, each background process creates its own session and acknowledges that
+before the launcher returns, isolating it from cancellation of the launching process group.
 
 Each option set has `index-<key>.requested`, `.worker.lock` and `.log` files in
 `<store>/.memfind/`. Repeated requests coalesce into one more incremental pass.

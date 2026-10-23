@@ -44,8 +44,25 @@ with tempfile.TemporaryDirectory(prefix="memfind-index-hook-") as directory:
 
     def request(source):
         before = time.monotonic()
-        result = run("index-hook", input=json.dumps({"hook_event_name": "SessionStart", "source": source}))
-        assert not result.stdout and not result.stderr, result
+        with subprocess.Popen(base + ["index-hook"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, env=env, start_new_session=os.name != "nt") as launcher:
+            stdout, stderr = launcher.communicate(json.dumps({"hook_event_name": "SessionStart", "source": source}), timeout=10)
+            assert launcher.returncode == 0 and not stdout and not stderr, (stdout, stderr)
+            if os.name != "nt" and source == "startup":
+                deadline = time.monotonic() + 3
+                while True:
+                    logs = "\n".join(path.read_text() for path in (store / ".memfind").glob("index-*.log"))
+                    pids = re.findall(r"worker pid=(\d+) started", logs)
+                    if pids:
+                        pid = int(pids[-1])
+                        assert os.getsid(pid) == pid, "worker must detach from the launching session before hook completion"
+                        break
+                    assert time.monotonic() < deadline, "worker never started"
+                    time.sleep(.02)
+                try:
+                    os.killpg(launcher.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
         assert time.monotonic() - before < 5, "hook launcher waited for indexing"
 
     def wait_for(memories, messages):
