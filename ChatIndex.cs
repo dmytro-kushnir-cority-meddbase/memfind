@@ -50,7 +50,7 @@ internal sealed class ChatState
 internal static class ChatIndex
 {
     /// <summary>Layout of chats.meta.jsonl; a lower value in chats.state.json is refused at search time.</summary>
-    public const int MetaVersion = 2;
+    public const int MetaVersion = 3;
 
     public static string Dir(string root) => System.IO.Path.Combine(root, ".memfind");
 
@@ -74,10 +74,10 @@ internal static class ChatIndex
 
     public static int Build(string root, bool rebuild, bool includeAgents, ModelSpec spec, bool gpu)
     {
-        var projects = Chats.ProjectsRoot;
-        if (!Directory.Exists(projects))
+        var roots = new[] { Paths.ClaudeProjects, Paths.CodexSessions };
+        if (!roots.Any(Directory.Exists))
         {
-            Console.Error.WriteLine($"transcripts not found: {projects}");
+            Console.Error.WriteLine($"transcripts not found: {string.Join(", ", roots)}");
             return 1;
         }
 
@@ -120,9 +120,12 @@ internal static class ChatIndex
         }
 
         var total = Stopwatch.StartNew();
-        var files = Chats.Discover(projects, includeAgents);
+        var files = roots.SelectMany(path => Chats.Discover(path, includeAgents))
+            .Distinct(Paths.Comparer)
+            .Where(path => includeAgents || !Transcript.Inspect(path).Agent)
+            .OrderBy(path => path, Paths.Comparer).ToList();
 
-        var known = new Dictionary<string, List<ChatFileState>>(StringComparer.OrdinalIgnoreCase);
+        var known = new Dictionary<string, List<ChatFileState>>(Paths.Comparer);
         foreach (var record in state.Files)
         {
             if (!known.TryGetValue(record.Path, out var list))
@@ -139,13 +142,13 @@ internal static class ChatIndex
                 long Length,
                 string LastWrite
             )>();
-        var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var dropped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var present = new HashSet<string>(Paths.Comparer);
+        var dropped = new HashSet<string>(Paths.Comparer);
         var skipped = 0;
 
         foreach (var path in files)
         {
-            var relative = System.IO.Path.GetRelativePath(projects, path);
+            var relative = System.IO.Path.GetFullPath(path);
             present.Add(relative);
 
             var info = new FileInfo(path);
@@ -159,7 +162,7 @@ internal static class ChatIndex
                     skipped++;
                     continue;
                 }
-                if (info.Length > last.Length)
+                if (info.Length > last.Length && !Transcript.IsCompressed(path))
                 {
                     work.Add((path, relative, last.Length, last.Lines, info.Length, lastWrite));
                     continue;
@@ -223,7 +226,7 @@ internal static class ChatIndex
                     new ChatFileState
                     {
                         Path = work[i].Relative,
-                        Length = result.Consumed,
+                        Length = Transcript.IsCompressed(work[i].Path) ? work[i].Length : result.Consumed,
                         Lines = work[i].FromLine + result.Lines,
                         LastWriteUtc = work[i].LastWrite,
                         ItemsFrom = next,
@@ -239,7 +242,7 @@ internal static class ChatIndex
                     new ChatFileState
                     {
                         Path = work[i].Relative,
-                        Length = result.Consumed,
+                        Length = Transcript.IsCompressed(work[i].Path) ? work[i].Length : result.Consumed,
                         Lines = work[i].FromLine + result.Lines,
                         LastWriteUtc = work[i].LastWrite,
                         ItemsFrom = next,
@@ -265,25 +268,32 @@ internal static class ChatIndex
 
             var vectors = new float[(long)items.Count * spec.Dim];
             var embed = Stopwatch.StartNew();
-            var reported = 0;
+            var reportedAt = TimeSpan.Zero;
+            long reportedCharacters = 0;
+            var characters = items.Select(item => item.Characters).ToArray();
             embedder.EmbedMany(
                 tokens,
                 vectors,
-                done =>
+                (done, chars) =>
                 {
-                    if (done - reported < 20000)
+                    if (embed.Elapsed - reportedAt < TimeSpan.FromSeconds(10) && done < items.Count)
                         return;
-                    reported = done;
+                    var rate = (chars - reportedCharacters) / Math.Max((embed.Elapsed - reportedAt).TotalSeconds, 0.001);
+                    reportedAt = embed.Elapsed;
+                    reportedCharacters = chars;
                     Console.Error.WriteLine(
-                        $"  embedded {done} / {items.Count} in {embed.Elapsed.TotalSeconds:F0} s"
+                        $"  embedded {done} / {items.Count} in {embed.Elapsed.TotalSeconds:F0} s, "
+                            + $"{rate:F0} chars/s (average {chars / Math.Max(embed.Elapsed.TotalSeconds, 0.001):F0})"
                     );
-                }
+                },
+                characters
             );
             embed.Stop();
 
             Console.Error.WriteLine(
                 $"embedded {items.Count} items in {embed.Elapsed.TotalSeconds:F1} s "
                     + $"({items.Count / Math.Max(embed.Elapsed.TotalSeconds, 0.001):F0} items/s, "
+                    + $"{characters.Sum(c => (long)c) / Math.Max(embed.Elapsed.TotalSeconds, 0.001):F0} chars/s, "
                     + $"1 session x {embedder.IntraOpThreads} intra-op threads)"
             );
 
@@ -357,6 +367,7 @@ internal static class ChatIndex
         writer.WriteStartObject();
         writer.WriteNumber("i"u8, index);
         writer.WriteString("file"u8, item.File);
+        writer.WriteString("source"u8, item.Source);
         writer.WriteString("session"u8, item.Session);
         writer.WriteString("cwd"u8, item.Cwd);
         writer.WriteString("role"u8, item.Role);
@@ -572,7 +583,7 @@ internal static class ChatIndex
             using var document = JsonDocument.Parse(line);
             var element = document.RootElement;
             var file = Get(element, "file");
-            var slug = file.Split('\\', '/')[0];
+            var slug = System.IO.Path.GetFileName(Get(element, "cwd"));
             var session = Get(element, "session");
             var ts = Get(element, "ts");
             var time = DateTimeOffset.TryParse(ts, out var parsed)
@@ -581,12 +592,9 @@ internal static class ChatIndex
 
             rows.Add(
                 new Row(
-                    file.Split('\\', '/')
-                        .Any(s => s.Equals("subagents", StringComparison.OrdinalIgnoreCase))
-                        ? "agent"
-                        : "chat",
+                    Get(element, "source"),
                     score,
-                    System.IO.Path.Combine(Chats.ProjectsRoot, file),
+                    file,
                     GetNumber(element, "line"),
                     Get(element, "uuid"),
                     (int)GetNumber(element, "chunk"),

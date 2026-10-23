@@ -11,11 +11,16 @@
     <PublishAot>true</PublishAot>
     <IsAotCompatible>true</IsAotCompatible>
     <OptimizationPreference>Speed</OptimizationPreference>
+    <OnnxRuntimeVersion>1.30.0</OnnxRuntimeVersion>
+    <!-- Newer packages no longer ship an Intel macOS native library. -->
+    <OnnxRuntimeVersion Condition="'$(RuntimeIdentifier)' == 'osx-x64' Or ('$(RuntimeIdentifier)' == '' And '$(NETCoreSdkRuntimeIdentifier)' == 'osx-x64')">1.23.2</OnnxRuntimeVersion>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.30.0" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="$(OnnxRuntimeVersion)" Condition="!$([MSBuild]::IsOSPlatform('OSX'))" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="$(OnnxRuntimeVersion)" Condition="$([MSBuild]::IsOSPlatform('OSX'))" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
     <PackageReference Include="System.Numerics.Tensors" Version="10.0.12" />
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
   </ItemGroup>
 </Project>

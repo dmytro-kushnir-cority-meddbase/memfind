@@ -29,7 +29,29 @@ for (var i = 0; i < args.Length; i++)
                 Console.Error.WriteLine("--store needs a path");
                 return 2;
             }
-            store = args[++i];
+            store = Paths.Expand(args[++i]);
+            break;
+
+        case "--claude-projects" or "--codex-sessions" or "--codex-memories":
+            var flag = args[i];
+            if (i + 1 >= args.Length)
+            {
+                Console.Error.WriteLine($"{flag} needs a path");
+                return 2;
+            }
+            var path = Paths.Expand(args[++i]);
+            if (flag == "--claude-projects")
+            {
+                Paths.ClaudeProjects = path;
+            }
+            else if (flag == "--codex-sessions")
+            {
+                Paths.CodexSessions = path;
+            }
+            else
+            {
+                Paths.CodexMemories = path;
+            }
             break;
 
         case "-k":
@@ -147,7 +169,8 @@ if (words.Count == 0)
 
 if (words.Count == 1 && words[0] == "index")
 {
-    using var mutex = new Mutex(false, @"Global\memfind-index");
+    Directory.CreateDirectory(store);
+    using var mutex = new Mutex(false, OperatingSystem.IsWindows() ? @"Global\memfind-index" : "memfind-index");
     bool acquired;
     try
     {
@@ -233,10 +256,8 @@ try
     var code = MemFind.Index.Search(store, specs, query, k, json, embedders);
     if (!json)
         Console.WriteLine();
-    return ChatIndex.Search(store, specs, query, k, json, embedders) is var chatCode
-        && code != 0
-        ? code
-        : chatCode;
+    var chatCode = ChatIndex.Search(store, specs, query, k, json, embedders);
+    return code == 0 || chatCode == 0 ? 0 : 1;
 }
 finally
 {
@@ -365,9 +386,9 @@ static void Usage()
 {
     Console.WriteLine(
         """
-        memfind — semantic search over the Claude Code memory store and chat transcripts
+        memfind — semantic search over memories, Claude Code and Codex transcripts
 
-          memfind index [options]              build both indexes (<store>\.memfind\)
+          memfind index [options]              build both indexes (<store>/.memfind/)
           memfind <query words...> [-k N]      search memories, chats and agent chats; default k=5
           memfind ... --model bge|gemma|both   which model to index/search with
           memfind <query words...> --chats     search chat transcripts only (main and agent)
@@ -386,7 +407,10 @@ static void Usage()
           --threads N      intra-op and parse threads (default: half the cores)
 
         Options:
-          --store <path>   memory store root (default: C:\Git\docs\memory)
+          --store <path>   memory/index root (MEMFIND_STORE or local app data/memfind/memory)
+          --claude-projects <path>  Claude transcripts (default: ~/.claude/projects)
+          --codex-sessions <path>   Codex rollouts (default: $CODEX_HOME/sessions or ~/.codex/sessions)
+          --codex-memories <path>   Codex memory (default: $CODEX_HOME/memories or ~/.codex/memories)
           -k N             number of hits to print per source (default: 5)
           -c N             messages of context on each side of a shown message (default: 3)
           --json           one JSON object per line instead of columns
@@ -395,9 +419,8 @@ static void Usage()
           --memories, --memory-only search memories only
           --all            search everything (the default)
 
-        Every hit names its source right after the score: memory (memory store),
-        chat (a main session transcript) or agent (a subagent transcript); --json
-        carries the same value in "source".
+        Every hit names its source: memory, chat/agent (Claude), or codex/codex-agent.
+        --json carries the same value in "source". Paths support ~ and native separators.
 
         A chat hit prints three lines: the score row, the transcript path with the
         1-based line number of the message, then a 160-char preview. Feed that
@@ -407,10 +430,10 @@ static void Usage()
         2 bad arguments.
 
         Models: bge-small-en-v1.5 (384-dim, int8, the default) and embeddinggemma-300m
-        (768-dim, int8), cached in %LOCALAPPDATA%\memfind\, downloaded from
+        (768-dim, int8), cached in local app data/memfind/, downloaded from
         huggingface.co on first use. Each keeps its own index files; gemma's carry a
         .gemma suffix. --model both searches each and fuses the two rankings (RRF),
-        printing the fused score. Transcripts are read from %USERPROFILE%\.claude\projects.
+        printing the fused score. Indexing reads both Claude and Codex session roots.
 
         Examples:
           memfind index
@@ -418,7 +441,7 @@ static void Usage()
           memfind "unsigned installer" -k 10
           memfind NUL-filled build output --chats
           memfind junction scope dir --memories
-          memfind show C:\Users\me\.claude\projects\C--Git\a1b2.jsonl:8412 -c 2
+          memfind show ~/.codex/sessions/2026/10/22/rollout-example.jsonl:42 -c 2
         """
     );
 }

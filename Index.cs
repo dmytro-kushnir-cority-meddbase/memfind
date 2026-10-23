@@ -11,6 +11,9 @@ internal sealed class IndexItem
     [JsonPropertyName("file")]
     public string File { get; set; } = "";
 
+    [JsonPropertyName("line")]
+    public int Line { get; set; }
+
     [JsonPropertyName("theme")]
     public string Theme { get; set; } = "";
 
@@ -74,6 +77,7 @@ internal static class Index
             var item = new IndexItem
             {
                 File = doc.File,
+                Line = doc.Line,
                 Theme = doc.Theme,
                 Title = doc.Title,
                 Description = doc.Description,
@@ -91,8 +95,25 @@ internal static class Index
         if (pending.Count > 0)
         {
             using var embedder = Embedder.Load(spec, gpu);
+            var embed = Stopwatch.StartNew();
+            var reportedAt = TimeSpan.Zero;
+            long characters = 0;
+            long reportedCharacters = 0;
+            var embedded = 0;
             foreach (var (i, text) in pending)
+            {
                 items[i].Vec = embedder.EmbedDocument(text);
+                characters += text.Length;
+                embedded++;
+                if (embed.Elapsed - reportedAt >= TimeSpan.FromSeconds(10) || embedded == pending.Count)
+                {
+                    var rate = (characters - reportedCharacters) / Math.Max((embed.Elapsed - reportedAt).TotalSeconds, 0.001);
+                    Console.Error.WriteLine($"  memories: embedded {embedded} / {pending.Count}, {rate:F0} chars/s "
+                        + $"(average {characters / Math.Max(embed.Elapsed.TotalSeconds, 0.001):F0})");
+                    reportedAt = embed.Elapsed;
+                    reportedCharacters = characters;
+                }
+            }
         }
 
         var dir = System.IO.Path.Combine(root, ".memfind");
@@ -165,6 +186,7 @@ internal static class Index
             var y = b[i];
             if (
                 x.File != y.File
+                || x.Line != y.Line
                 || x.Theme != y.Theme
                 || x.Title != y.Title
                 || x.Description != y.Description
@@ -239,6 +261,7 @@ internal static class Index
                 writer.WriteString("source"u8, "memory");
                 writer.WriteNumber("score"u8, Math.Round(score, 4));
                 writer.WriteString("file"u8, item.File);
+                writer.WriteNumber("line"u8, item.Line);
                 writer.WriteString("theme"u8, item.Theme);
                 writer.WriteString("title"u8, item.Title);
                 writer.WriteString("description"u8, item.Description);
@@ -255,7 +278,7 @@ internal static class Index
         foreach (var (item, score) in hits)
         {
             Console.WriteLine(
-                $"{score:F3}  memory  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}   {item.Title}"
+                $"{score:F3}  memory  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}{(item.Line > 0 ? $":{item.Line}" : "")}   {item.Title}"
             );
             Console.WriteLine($"       {Truncate(item.Description, 160)}");
         }
@@ -272,7 +295,7 @@ internal static class Index
         Dictionary<ModelSpec, Task<Embedder>> embedders
     )
     {
-        var fused = new Dictionary<string, (IndexItem Item, float Score, List<Leg> Legs)>();
+        var fused = new Dictionary<(string File, int Line, string Hash), (IndexItem Item, float Score, List<Leg> Legs)>();
         var legs = 0;
 
         foreach (var spec in specs)
@@ -285,10 +308,11 @@ internal static class Index
             for (var rank = 1; rank <= hits.Count; rank++)
             {
                 var (item, score) = hits[rank - 1];
-                if (!fused.TryGetValue(item.File, out var entry))
+                var key = (item.File, item.Line, item.TextHash);
+                if (!fused.TryGetValue(key, out var entry))
                     entry = (item, 0f, []);
                 entry.Legs.Add(new Leg(spec.Key, score, rank));
-                fused[item.File] = (entry.Item, entry.Score + 1f / (RrfK + rank), entry.Legs);
+                fused[key] = (entry.Item, entry.Score + 1f / (RrfK + rank), entry.Legs);
             }
         }
 
@@ -311,6 +335,7 @@ internal static class Index
                 writer.WriteString("source"u8, "memory");
                 writer.WriteNumber("score"u8, Math.Round(score, 4));
                 writer.WriteString("file"u8, item.File);
+                writer.WriteNumber("line"u8, item.Line);
                 writer.WriteString("theme"u8, item.Theme);
                 writer.WriteString("title"u8, item.Title);
                 writer.WriteString("description"u8, item.Description);
@@ -328,7 +353,7 @@ internal static class Index
         foreach (var (item, score, hitLegs) in rows)
         {
             Console.WriteLine(
-                $"{score:F3}  memory  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}   {item.Title}   [{Describe(hitLegs)}]"
+                $"{score:F3}  memory  {item.Theme.PadRight(themeWidth)}   {item.File.PadRight(fileWidth)}{(item.Line > 0 ? $":{item.Line}" : "")}   {item.Title}   [{Describe(hitLegs)}]"
             );
             Console.WriteLine($"       {Truncate(item.Description, 160)}");
         }

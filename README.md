@@ -1,7 +1,59 @@
 # memfind
 
-Semantic search over the Claude Code memory store (`C:\Git\docs\memory`) and the chat transcripts
-under `%USERPROFILE%\.claude\projects`. One NativeAOT exe, no service, no server.
+Semantic search over a Markdown memory store, Codex memory, and local Claude Code and Codex transcripts.
+One NativeAOT executable, no service, no server. Embeddings run locally; model weights are downloaded on first use.
+
+## Run locally
+
+Requires the .NET 10 SDK. On macOS the CPU ONNX Runtime package is selected automatically;
+Windows and Linux retain the GPU package (CPU inference also works with it).
+Intel macOS selects ONNX Runtime 1.23.2 because the newer packages no longer contain
+`osx-x64` native binaries; Apple Silicon keeps 1.30.0.
+
+```sh
+dotnet build -c Release
+dotnet run -c Release --no-build -- index
+dotnet run -c Release --no-build -- "what did we decide about deployment"
+dotnet run -c Release --no-build -- stats --json
+python3 tests/smoke.py
+# Or test a published executable: python3 tests/smoke.py path/to/publish/memfind
+# Two-model regression (downloads Gemma too): python3 tests/models.py path/to/publish/memfind
+```
+
+The smoke check creates isolated Claude/Codex/memory fixtures and runs real bge embeddings,
+search, show, incremental updates, agent filtering, deletions and memory edits. It needs the
+first-use model download, and does not index or change your real histories.
+
+To publish a native executable for the current platform: `dotnet publish -c Release`.
+
+## Source paths
+
+Paths use the current OS conventions and support `~` in CLI arguments. A missing source is
+skipped when another transcript root exists. The default store is created on `index`.
+
+| Source | Default | Override |
+| --- | --- | --- |
+| Memory/index store | .NET local application data directory + `memfind/memory` | `--store PATH` or `MEMFIND_STORE` |
+| Claude chats | `~/.claude/projects` | `--claude-projects PATH` |
+| Codex chats | `~/.codex/sessions` | `--codex-sessions PATH` |
+| Codex memory | `~/.codex/memories` | `--codex-memories PATH` |
+
+`CODEX_HOME` replaces `~/.codex` for both Codex roots. Existing Windows memory stores can
+still be selected with `--store C:\Git\docs\memory`.
+
+Codex memory includes `MEMORY.md`, `memory_summary.md`, `rollout_summaries/**/*.md` and
+`extensions/ad_hoc/notes/**/*.md`. It is chunked into passages with original file and line
+anchors, in the same memory index as the ordinary Markdown store. Raw memory intermediates
+and skill files are excluded.
+
+Codex sessions use `session_meta` for session/cwd/agent identity and canonical
+`response_item` user/assistant messages for text. Tool results, reasoning, system/developer
+messages and duplicate `event_msg` records are excluded. Short Codex messages are retained.
+`--no-agents` also excludes Codex rollouts whose session metadata identifies a subagent.
+Both `.jsonl` and compressed `.jsonl.zst` sessions are read directly, including by `show`.
+Archive anchors use decompressed line numbers. Unchanged archives are skipped; a changed
+archive is replaced in the index in full. No external `zstd` command is needed.
+Source transcripts and memories are read only; indexes are written only under the store.
 
 ## Commands
 
@@ -22,7 +74,10 @@ builds each model in turn; on a query it searches with each and fuses the two ra
 
 | Flag | Applies to | Meaning |
 | --- | --- | --- |
-| `--store <path>` | all | Memory store root (default `C:\Git\docs\memory`) |
+| `--store <path>` | all | Memory/index store root (see Source paths) |
+| `--claude-projects <path>` | all | Claude transcript root |
+| `--codex-sessions <path>` | all | Codex transcript root |
+| `--codex-memories <path>` | all | Codex memory root |
 | `-k N` | queries | Hits per source (default 5) |
 | `-c N` | `show` | Kept messages of context on each side (default 3) |
 | `--json` | queries, `show`, `stats` | JSONL instead of columns |
@@ -48,8 +103,7 @@ builds each model in turn; on a query it searches with each and fuses the two ra
 ## Output — text
 
 The first line of every hit starts with the score, then the source padded to six characters:
-`memory` (memory store), `chat` (a main session transcript) or `agent` (a subagent transcript,
-any path with a `subagents` directory, workflow agents included). A default search prints the
+`memory` (memory store), `chat`/`agent` (Claude main/subagent transcripts) or `codex`/`codex-agent` (Codex main/subagent rollouts). A default search prints the
 memory hits, a blank line, then the chat and agent hits ranked together.
 
 Memory hit, two lines:
@@ -90,8 +144,8 @@ it as local time. `score` is rounded to 4 decimals.
 
 | Shape | Fields |
 | --- | --- |
-| Memory hit | `source="memory"`, `score`, `file`, `theme`, `title`, `description` |
-| Chat hit | `source="chat"` (main transcript) or `"agent"` (subagent transcript), `score`, `file` (full transcript path), `line`, `uuid`, `chunk`, `session`, `cwd`, `role`, `ts`, `text` (the stored preview) |
+| Memory hit | `source="memory"`, `score`, `file`, `theme`, `title`, `description`, `line` (Codex memory passage anchor; 0 for ordinary store documents) |
+| Chat hit | `source="chat"`/`"agent"` (Claude) or `"codex"`/`"codex-agent"` (Codex), `score`, `file` (full transcript path), `line`, `uuid`, `chunk`, `session`, `cwd`, `role`, `ts`, `text` (the stored preview) |
 | `show` | `role`, `ts`, `line`, `uuid`, `anchor` (bool), `text` (full) |
 | `stats` | `store`, `memories`, `memoryBytes`, `memoryModel`, `chatItems`, `transcripts`, `chatModel`, `includeAgents`, `metaVersion`, `vecBytes`, `metaBytes`, `stateBytes`, `threads`, `batch`, `cores`, `models` |
 
@@ -106,26 +160,30 @@ top-level `uuid`. A long message is split into chunks that share `line` and `uui
 
 ## On disk
 
-All under `<store>\.memfind\` (with a `.gitignore` of `*`).
+All under `<store>/.memfind/` (with a `.gitignore` of `*`).
 
 | File | Schema |
 | --- | --- |
 | `index.json` | `{model, dim, builtAt, items:[{file, theme, title, description, vec[dim]}]}` — the memory index, read whole |
 | `chats.vec` | Raw little-endian `float32[dim]` per item, back to back; item *i* is at `i * dim * 4` bytes. Memory-mapped at search time |
-| `chats.meta.jsonl` | One object per item, in `chats.vec` order: `{i, file, session, cwd, role, ts, line, uuid, chunk, text}`. `file` is relative to the projects root; `text` is the 300-char preview |
-| `chats.state.json` | `{model, dim, metaVersion, includeAgents, files:[{path, length, lines, lastWriteUtc, itemsFrom, itemsCount}]}` — the incremental state: bytes and lines already consumed per transcript, and the item range they produced |
+| `chats.meta.jsonl` | One object per item, in `chats.vec` order: `{i, file, source, session, cwd, role, ts, line, uuid, chunk, text}`. `file` is an absolute native path; `text` is the 300-char preview |
+| `chats.state.json` | `{model, dim, metaVersion, includeAgents, files:[{path, length, lines, lastWriteUtc, itemsFrom, itemsCount}]}` — the incremental state: bytes and lines already consumed per transcript (compressed file size for archives), and the item range they produced |
+
+Index progress reports processed fragments and characters per second (current interval and
+overall embedding average). Characters count the text supplied to the embedder, excluding
+JSON records and tool output; the count uses .NET UTF-16 string length.
 
 Each model keeps its own set. bge (and `bge-fp32`, which shares them) uses the names above;
 gemma inserts its key: `index.gemma.json`, `chats.gemma.vec`, `chats.gemma.meta.jsonl`,
 `chats.gemma.state.json`. `dim` is 384 for bge, 768 for gemma.
 
-`metaVersion` is the layout of `chats.meta.jsonl` (currently **2**). A search against an older one
+`metaVersion` is the layout of `chats.meta.jsonl` (currently **3**). Version 3 adds absolute paths and source tags for mixed Claude/Codex roots. A search against an older one
 fails with `chats.meta.jsonl is old — run: memfind index --rebuild` and exit 1; `index` rebuilds
 from scratch on the mismatch instead.
 
 ## Models
 
-| Key | Model | Dim | Files in `%LOCALAPPDATA%\memfind\<model>\` |
+| Key | Model | Dim | Files in the OS local application data directory under `memfind/<model>/` |
 | --- | --- | --- | --- |
 | `bge` (default) | bge-small-en-v1.5, int8 | 384 | `model.onnx`, `vocab.txt` |
 | `bge-fp32` | bge-small-en-v1.5, fp32 | 384 | `model.onnx`, `vocab.txt` |
@@ -149,7 +207,7 @@ one line to stderr and is skipped; with no legs left the query exits 1.
 
 ### `--gpu`
 
-`index --gpu` runs the CUDA execution provider. The package is `Microsoft.ML.OnnxRuntime.Gpu`,
+`index --gpu` tries CUDA auto-detection on Windows and reports CPU fallback elsewhere. The package is `Microsoft.ML.OnnxRuntime.Gpu`,
 which costs 178 MB of `onnxruntime_providers_cuda.dll` in the publish output (245 MB total, against
 23 MB for the CPU-only build).
 
@@ -167,7 +225,46 @@ Measured here (RTX 5060, cuDNN 9.26, 256-token chunks, batch 64): gemma int8 13.
 vs 182.5 on CUDA; bge int8 73.8 on CPU. The gemma memory index takes 29.9 s on CPU and 4.7 s on
 GPU. Queries are ~40 ms, so search has no `--gpu`.
 
-## SessionStart hook
+## Codex prompt context hook
+
+`hooks/memfind_context.py` searches existing BGE memory and chat indexes on
+`UserPromptSubmit`. It emits Codex `additionalContext` with up to four excerpts
+and their file/line anchors, capped at 3000 characters total. It skips prompts
+shorter than 12 characters, scores below 0.72, duplicate texts, repeated files,
+and the current session/transcript. Excerpts are labelled as historical,
+untrusted reference data. The search has a ten-second timeout and errors leave
+the prompt unchanged. It never runs indexing, and skips retrieval if the BGE
+model files are absent so that submitting a prompt cannot download a model.
+
+Copy the script to your Codex home (`$CODEX_HOME` or `~/.codex`) under
+`hooks/memfind_context.py`, then merge this entry into that home's `hooks.json`.
+Use absolute paths to your Python 3 interpreter and installed script:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python3 /absolute/path/to/.codex/hooks/memfind_context.py",
+        "timeout": 12,
+        "additionalContextLimit": 3000
+      }]
+    }]
+  }
+}
+```
+
+On Windows use `commandWindows` with your Python/script paths quoted as needed.
+`memfind` must be on the hook's PATH (macOS also checks `/usr/local/bin/memfind`).
+Review and trust the hook in Codex `/hooks` or the app's Hooks settings, then
+start a new chat. Codex skips untrusted hook definitions. Local command hooks
+require local orchestration; see the [official hooks documentation](https://learn.chatgpt.com/docs/hooks).
+Update indexes separately with `memfind index --model bge`.
+
+Hook checks: `python3 tests/hook.py -v` (isolated behavior tests).
+
+## Claude SessionStart hook
 
 `~/.claude/settings.json` runs the index on every session start, async so it never blocks:
 
@@ -178,6 +275,6 @@ GPU. Queries are ~40 ms, so search has no `--gpu`.
 
 ## The mutex
 
-`index` takes `Global\memfind-index` without waiting. A second one — parallel sessions starting
+`index` takes `Global\memfind-index` on Windows and `memfind-index` on Unix without waiting. A second one — parallel sessions starting
 together — prints `memfind: another index is running, skipping` and exits 0, so concurrent hooks
 never race on `chats.vec`.

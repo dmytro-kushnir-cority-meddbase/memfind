@@ -12,6 +12,8 @@ internal sealed class ChatItem
     public string Uuid = "";
     public long Line;
     public int Chunk;
+    public string Source = "";
+    public int Characters;
     public string Preview = "";
     public int[] Tokens = [];
 }
@@ -37,13 +39,6 @@ internal static class Chats
     /// <summary>A single line longer than this is skipped rather than buffered.</summary>
     public const int MaxLineBytes = 1 << 26;
 
-    public static string ProjectsRoot =>
-        Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".claude",
-            "projects"
-        );
-
     public static List<string> Discover(string root, bool includeAgents)
     {
         var files = new List<string>();
@@ -55,8 +50,13 @@ internal static class Chats
 
     private static void Walk(string dir, bool includeAgents, List<string> files)
     {
-        foreach (var file in Directory.EnumerateFiles(dir, "*.jsonl"))
-            files.Add(file);
+        foreach (var file in Directory.EnumerateFiles(dir))
+        {
+            if (file.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase) || Transcript.IsCompressed(file))
+            {
+                files.Add(file);
+            }
+        }
 
         foreach (var sub in new DirectoryInfo(dir).EnumerateDirectories())
         {
@@ -85,23 +85,20 @@ internal static class Chats
     )
     {
         var result = new ParseResult { Consumed = from };
+        var transcript = Transcript.Inspect(path);
 
-        using var stream = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.ReadWrite,
-            1 << 20,
-            FileOptions.SequentialScan
-        );
-        var length = stream.Length;
+        using var stream = Transcript.Open(path);
+        var length = stream.CanSeek ? stream.Length : long.MaxValue;
         if (from >= length)
         {
             result.Consumed = length;
             return result;
         }
 
-        stream.Position = from;
+        if (stream.CanSeek)
+        {
+            stream.Position = from;
+        }
 
         var buffer = new byte[ReadChunk];
         var filled = 0;
@@ -155,7 +152,7 @@ internal static class Chats
                 if (line.Length == 0)
                     continue;
 
-                ReadLine(line, relative, fromLine + result.Lines, includeAgents, embedder, result);
+                ReadLine(line, relative, fromLine + result.Lines, includeAgents, embedder, result, transcript);
             }
 
             consumed += start;
@@ -174,13 +171,14 @@ internal static class Chats
         long number,
         bool includeAgents,
         Embedder embedder,
-        ParseResult result
+        ParseResult result,
+        Transcript transcript
     )
     {
-        if (!TryReadKept(line, includeAgents, out var message))
+        if (!transcript.TryRead(line, number, includeAgents, out var message))
             return;
 
-        var chunks = Chunk(message.Text);
+        var chunks = Chunk(message.Text, transcript.Codex ? 1 : MinChars);
         for (var i = 0; i < chunks.Count; i++)
         {
             var chunk = chunks[i];
@@ -188,6 +186,8 @@ internal static class Chats
                 new ChatItem
                 {
                     File = relative,
+                    Source = transcript.Source,
+                    Characters = chunk.Length,
                     Session = message.Session,
                     Cwd = message.Cwd,
                     Role = message.Role,
@@ -495,7 +495,7 @@ internal static class Chats
         return text.Trim();
     }
 
-    public static List<string> Chunk(string text)
+    public static List<string> Chunk(string text, int minChars = MinChars)
     {
         var chunks = new List<string>();
         var pos = 0;
@@ -505,14 +505,14 @@ internal static class Chats
             if (text.Length - pos <= MaxChars)
             {
                 var tail = text[pos..].Trim();
-                if (tail.Length >= MinChars)
+                if (tail.Length >= minChars)
                     chunks.Add(tail);
                 break;
             }
 
             var end = FindBreak(text, pos);
             var chunk = text[pos..end].Trim();
-            if (chunk.Length >= MinChars)
+            if (chunk.Length >= minChars)
                 chunks.Add(chunk);
             pos = end;
         }
