@@ -12,6 +12,8 @@ internal sealed partial class Ctx : JsonSerializerContext;
 /// <summary>One JSON object per stdout line, written straight as UTF-8 (no reflection, AOT-safe).</summary>
 internal sealed class JsonLines : IDisposable
 {
+    public static bool FullPrecision { get; set; }
+    public static double Score(float score) => FullPrecision ? score : Math.Round(score, 4);
     private readonly Stream _stream = Console.OpenStandardOutput();
     private readonly ArrayBufferWriter<byte> _buffer = new(4096);
     private readonly Utf8JsonWriter _writer;

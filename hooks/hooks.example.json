@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "/usr/local/bin/memfind context-hook",
+        "timeout": 10,
+        "additionalContextLimit": 3000
+      }]
+    }]
+  }
+}

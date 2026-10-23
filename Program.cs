@@ -89,6 +89,14 @@ for (var i = 0; i < args.Length; i++)
             gpu = true;
             break;
 
+        case "--offline":
+            Embedder.AllowDownloads = false;
+            break;
+
+        case "--full-precision":
+            JsonLines.FullPrecision = true;
+            break;
+
         case "--model":
             if (i + 1 >= args.Length)
             {
@@ -167,44 +175,32 @@ if (words.Count == 0)
     return 0;
 }
 
+if (words.Count == 1 && words[0] == "context-hook")
+{
+    return await ContextHook.RunAsync(store);
+}
+
 if (words.Count == 1 && words[0] == "index")
 {
     Directory.CreateDirectory(store);
-    using var mutex = new Mutex(false, OperatingSystem.IsWindows() ? @"Global\memfind-index" : "memfind-index");
-    bool acquired;
-    try
-    {
-        acquired = mutex.WaitOne(0);
-    }
-    catch (AbandonedMutexException)
-    {
-        acquired = true;
-    }
-
-    if (!acquired)
+    using var indexLock = IndexLock.TryAcquire(store);
+    if (indexLock is null)
     {
         Console.Error.WriteLine("memfind: another index is running, skipping");
         return 0;
     }
 
-    try
+    var code = 0;
+    foreach (var spec in specs)
     {
-        var code = 0;
-        foreach (var spec in specs)
-        {
-            if (!chatsOnly)
-                code = MemFind.Index.Build(store, spec, gpu);
-            if (code == 0 && !memoryOnly)
-                code = ChatIndex.Build(store, rebuild, includeAgents, spec, gpu);
-            if (code != 0)
-                break;
-        }
-        return code;
+        if (!chatsOnly)
+            code = MemFind.Index.Build(store, spec, gpu);
+        if (code == 0 && !memoryOnly)
+            code = ChatIndex.Build(store, rebuild, includeAgents, spec, gpu);
+        if (code != 0)
+            break;
     }
-    finally
-    {
-        mutex.ReleaseMutex();
-    }
+    return code;
 }
 
 if (words.Count == 1 && words[0] == "stats")
@@ -395,6 +391,7 @@ static void Usage()
           memfind <query words...> --memories  search memories only
           memfind show <file>:<line> [-c N]    print that transcript message in full
           memfind stats                        what is indexed
+          memfind context-hook                 native Codex prompt hook (stdin/stdout JSON)
           memfind --help                       this screen
 
         Index options:
@@ -414,6 +411,8 @@ static void Usage()
           -k N             number of hits to print per source (default: 5)
           -c N             messages of context on each side of a shown message (default: 3)
           --json           one JSON object per line instead of columns
+          --full-precision preserve unrounded scores in JSON (used by context-hook)
+          --offline        fail instead of downloading missing model files
           --model <name>   bge (default), bge-fp32, gemma, or both
           --chats, --chats-only     search chat transcripts only (main and agent)
           --memories, --memory-only search memories only

@@ -637,7 +637,7 @@ internal static class ChatIndex
                 var writer = output.Writer;
                 writer.WriteStartObject();
                 writer.WriteString("source"u8, row.Source);
-                writer.WriteNumber("score"u8, Math.Round(row.Score, 4));
+                writer.WriteNumber("score"u8, JsonLines.Score(row.Score));
                 writer.WriteString("file"u8, row.Path);
                 writer.WriteNumber("line"u8, row.Line);
                 writer.WriteString("uuid"u8, row.Uuid);
@@ -709,7 +709,7 @@ internal static class ChatIndex
                 var writer = output.Writer;
                 writer.WriteStartObject();
                 writer.WriteString("source"u8, row.Source);
-                writer.WriteNumber("score"u8, Math.Round(score, 4));
+                writer.WriteNumber("score"u8, JsonLines.Score(score));
                 writer.WriteString("file"u8, row.Path);
                 writer.WriteNumber("line"u8, row.Line);
                 writer.WriteString("uuid"u8, row.Uuid);

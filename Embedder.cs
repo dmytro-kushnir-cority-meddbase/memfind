@@ -137,6 +137,7 @@ internal sealed record ModelSpec(
 
 internal sealed class Embedder : IDisposable
 {
+    public static bool AllowDownloads { get; set; } = true;
     public const int BatchSize = 64;
 
     private static int _threads = Math.Max(1, Environment.ProcessorCount / 2);
@@ -450,6 +451,9 @@ internal sealed class Embedder : IDisposable
     {
         if (File.Exists(path) && new FileInfo(path).Length > 0)
             return;
+
+        if (!AllowDownloads)
+            throw new FileNotFoundException("model file unavailable in offline mode", path);
 
         Console.Error.WriteLine($"downloading {Path.GetFileName(path)} from {url}");
 
