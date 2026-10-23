@@ -34,8 +34,10 @@ with tempfile.TemporaryDirectory(prefix="memfind-resident-") as directory:
 
     def hook():
         started = time.monotonic()
-        result = subprocess.run(base + ["context-hook"], input=event, capture_output=True,
-                                text=True, env=env, timeout=12)
+        # Deadline behavior is covered by HookContracts. Give cold real-model initialization
+        # room to finish even when a separate local indexing job is using the CPU.
+        result = subprocess.run(base + ["context-hook", "--budget-ms", "15000"], input=event, capture_output=True,
+                                text=True, env=env, timeout=20)
         # A child retaining stdout makes communicate() time out, even after the hook exits.
         lines = log.read_text().splitlines() if log.exists() else []
         children.update(int(pid) for pid in re.findall(r"started\(pid=(\d+),", "\n".join(lines)))
