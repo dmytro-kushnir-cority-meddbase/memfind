@@ -3,9 +3,18 @@
     "UserPromptSubmit": [{
       "hooks": [{
         "type": "command",
-        "command": "/usr/local/bin/memfind context-hook --store /path/to/memory --model both",
+        "command": "/usr/local/bin/memfind context-hook --store /path/to/memory --model gemma",
         "timeout": 10,
         "additionalContextLimit": 3000
+      }]
+    }],
+    "SessionStart": [{
+      "matcher": "^(startup|resume|clear|compact|fork)$",
+      "hooks": [{
+        "type": "command",
+        "command": "/usr/local/bin/memfind index-hook --store /path/to/memory --model gemma --threads 4",
+        "async": true,
+        "timeout": 10
       }]
     }]
   }

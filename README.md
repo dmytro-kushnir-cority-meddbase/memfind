@@ -1,7 +1,7 @@
 # memfind
 
 Semantic search over a Markdown memory store, Codex memory, and local Claude Code and Codex transcripts.
-One NativeAOT executable, no service, no server. Embeddings run locally; model weights are downloaded on first use.
+One NativeAOT executable, with an optional resident query process. Embeddings run locally; model weights are downloaded on first use.
 
 ## Run locally
 
@@ -60,6 +60,7 @@ Source transcripts and memories are read only; indexes are written only under th
 | Command | What it does |
 | --- | --- |
 | `memfind index [options]` | Build both indexes into `<store>\.memfind\` |
+| `memfind index-hook [options]` | Queue detached incremental indexing from a lifecycle hook (Gemma by default) |
 | `memfind <query words...>` | Search memories, chats and agent chats (memories first) |
 | `memfind <query words...> --chats` | Search chat transcripts only (main and agent) |
 | `memfind <query words...> --memories` | Search memories only |
@@ -71,6 +72,9 @@ Source transcripts and memories are read only; indexes are written only under th
 
 Every command takes `--model bge|bge-fp32|gemma|both`; `bge` is the default. On `index`, `both`
 builds each model in turn; on a query it searches with each and fuses the two rankings.
+`MEMFIND_MODELS=gemma` limits an installation to Gemma: ordinary queries and
+indexing default to it, explicit BGE requests fail before loading a model, and
+`both` and `stats` use only enabled models. Unset it to preserve the original defaults.
 
 ## Flags
 
@@ -242,6 +246,13 @@ It uses the `--model` value given on its command line (`bge`, `bge-fp32`, `gemma
 or `both`) and defaults to `both`, which fuses the bge and Gemma rankings (RRF) as
 `memfind --model both` does.
 
+Gemma query vectors come from a per-user resident `memfind serve` when available.
+The transport is .NET named pipes on Windows and Unix domain sockets on macOS/Linux,
+through the same `System.IO.Pipes` API. When no host answers, the hook starts an
+offline host with its own standard streams and computes this query locally. The
+resident exits after 30 idle minutes. Native executables and `dotnet memfind.dll`
+are supported; executable paths, builds, model files and thread counts isolate hosts.
+
 `additionalContext` is one header line, then one line per hit: memories first,
 then chat transcripts, at most `-k` (default 3) of each after the filters below.
 
@@ -322,15 +333,50 @@ Prepare indexes separately with `memfind index --model both` (or start with
 
 Hook checks: `dotnet run -c Release --project tests/HookContracts/HookContracts.csproj`
 (native contract checks and a real worker that runs out its budget; no Python).
+After publishing and caching both models, run
+`python3 tests/resident.py path/to/publish/memfind` (`memfind.exe` on Windows)
+to check detached autostart, stdout closure, paths containing spaces/quotes and
+resident reuse with real embeddings. It uses an isolated store and never downloads.
 
-## Claude SessionStart hook
+## Background lifecycle indexing
 
-`~/.claude/settings.json` runs the index on every session start, async so it never blocks:
+Add a second event inside Codex `hooks.json`'s `hooks` object (or Claude Code's
+`hooks` configuration):
 
 ```json
-{ "type": "command", "command": "C:\\Users\\dkushnir\\bin\\memfind\\memfind.exe",
-  "args": ["index"], "async": true, "timeout": 300 }
+{
+  "SessionStart": [{
+    "matcher": "^(startup|resume|clear|compact|fork)$",
+    "hooks": [{
+      "type": "command",
+      "command": "/usr/local/bin/memfind index-hook --model gemma --threads 4",
+      "async": true,
+      "timeout": 10
+    }]
+  }]
+}
 ```
+
+`SessionStart` covers new sessions, resumes and the continuation after compaction
+in Codex, so a separate `PreCompact` hook is unnecessary. `index-hook` also accepts
+`PreCompact` input for hosts configured that way. Review/trust the new hook in
+Codex `/hooks` and start a new chat to verify actual lifecycle delivery.
+
+The hook reads its event, leaves a request marker and launches an independent
+`index-worker`. The short launcher returns without waiting, and the worker
+survives the originating chat ending (ordinary Codex async hooks are cancelled
+with their session). Workers are always offline and default to Gemma. They
+capture the store, source roots, model and indexing options from the launcher.
+
+Each option set has `index-<key>.requested`, `.worker.lock` and `.log` files in
+`<store>/.memfind/`. Repeated requests coalesce into one more incremental pass.
+A worker waits for foreground indexing or other option sets to release the store
+writer lock. It removes the marker before scanning, checks again after releasing
+its worker lock to avoid a lost wakeup, and leaves a failed request for retry at
+the next lifecycle event. Logs contain progress and the final exit code.
+
+After caching Gemma, run `python3 tests/index_hook.py path/to/publish/memfind`
+for a real-model startup/compact regression with isolated sources and BGE disabled.
 
 ## Index writer lock
 
